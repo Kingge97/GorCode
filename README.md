@@ -107,17 +107,45 @@ Inject specialized knowledge into conversations:
 
 ## Installation
 
-```bash
-# Clone the repository
-git clone https://github.com/Kingge97/GorCode.git
-cd gorcode
+### 1. Clone the Repository
 
-# Install dependencies
+```bash
+git clone https://github.com/Kingge97/GorCode.git
+cd GorCode/GorCode
+```
+
+### 2. Install Dependencies
+
+**Option A: Using requirements.txt (Recommended for users)**
+```bash
+# Install dependencies from requirements.txt
+pip install -r requirements.txt
+```
+
+**Option B: Using pip install -e (Recommended for developers)**
+```bash
+# Install in editable mode
 pip install -e .
 
 # Or install with development dependencies
 pip install -e ".[dev]"
 ```
+
+### 3. Setup CLI Command (Optional)
+
+Run the setup script to add `gorcode` command to your PATH:
+
+**Windows (PowerShell):**
+```powershell
+.\scripts\setup-gorcode.ps1
+```
+
+**macOS/Linux:**
+```bash
+bash scripts/setup-gorcode.sh
+```
+
+After running the script, open a new terminal and you can use the `gorcode` command directly.
 
 ## Quick Start
 

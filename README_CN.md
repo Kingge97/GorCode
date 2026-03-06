@@ -107,17 +107,45 @@ GorCode 支持模型上下文协议以扩展功能：
 
 ## 安装
 
-```bash
-# 克隆仓库
-git clone https://github.com/Kingge97/GorCode.git
-cd gorcode
+### 1. 克隆仓库
 
-# 安装依赖
+```bash
+git clone https://github.com/Kingge97/GorCode.git
+cd GorCode/GorCode
+```
+
+### 2. 安装依赖
+
+**方式 A：使用 requirements.txt（推荐普通用户）**
+```bash
+# 从 requirements.txt 安装依赖
+pip install -r requirements.txt
+```
+
+**方式 B：使用 pip install -e（推荐开发者）**
+```bash
+# 以可编辑模式安装
 pip install -e .
 
 # 或安装开发依赖
 pip install -e ".[dev]"
 ```
+
+### 3. 设置 CLI 命令（可选）
+
+运行设置脚本将 `gorcode` 命令添加到 PATH：
+
+**Windows (PowerShell)：**
+```powershell
+.\scripts\setup-gorcode.ps1
+```
+
+**macOS/Linux：**
+```bash
+bash scripts/setup-gorcode.sh
+```
+
+运行脚本后，打开新的终端即可直接使用 `gorcode` 命令。
 
 ## 快速开始
 
