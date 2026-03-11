@@ -399,6 +399,13 @@ class BackendExecutor:
         """
         self._permission_callback = callback
         self._permission_manager.set_permission_callback(callback)
+        # Sync permission callback to TaskTool for subagent execution
+        if self._tool_registry:
+            task_tool = self._tool_registry.get("Task")
+            if task_tool and hasattr(task_tool, 'set_permission_callback'):
+                task_tool.set_permission_callback(callback)
+            if task_tool and hasattr(task_tool, 'set_permission_manager'):
+                task_tool.set_permission_manager(self._permission_manager)
 
     def set_reconnect_callback(self, callback):
         """
@@ -636,6 +643,11 @@ class BackendExecutor:
                 # 设置 agent 和 tool registry
                 task_tool.set_agent_registry(self._agent_registry)
                 task_tool.set_tool_registry(self._tool_registry)
+                # 设置权限管理与回调（如果已有）
+                if hasattr(task_tool, 'set_permission_manager'):
+                    task_tool.set_permission_manager(self._permission_manager)
+                if hasattr(task_tool, 'set_permission_callback'):
+                    task_tool.set_permission_callback(self._permission_callback)
                 
                 # 设置 config_manager，让 TaskTool 根据 agent_model_mapping 动态选择模型
                 if hasattr(task_tool, 'set_config_manager') and self._config_manager:

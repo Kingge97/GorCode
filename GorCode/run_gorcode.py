@@ -10,9 +10,12 @@ import sys
 import os
 from pathlib import Path
 
-# Add the GorCode directory to path
-gorcode_dir = Path(__file__).parent
-sys.path.insert(0, str(gorcode_dir))
+# Add repo root and GorCode dir to sys.path so imports work from any cwd
+repo_root = Path(__file__).resolve().parent.parent
+gorcode_dir = repo_root / "GorCode"
+for p in (str(repo_root), str(gorcode_dir)):
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
 # Import and run main
 from frontend.cli.main import main

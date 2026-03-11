@@ -7,12 +7,13 @@ Tool for spawning and managing subagents.
 
 import time
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
 from .base import BaseTool, ToolResult, ToolDefinition
 from ..core.events import EventBus, Event, EventType
 from ..context import CompactionManager, CompactionConfig, TokenEstimator
+from ..permission import get_permission_manager, PermissionType, PermissionResponse
 
 
 @dataclass
@@ -73,6 +74,8 @@ class TaskTool(BaseTool):
         event_bus: EventBus = None,
         parent_agent_name: str = None,
         config_manager=None,
+        permission_manager=None,
+        permission_callback=None,
     ):
         """
         Initialize Task tool.
@@ -94,6 +97,10 @@ class TaskTool(BaseTool):
         self._parent_agent_name = parent_agent_name
         self._config_manager = config_manager
         self._model_connectors: Dict[str, Any] = {}  # Cache for model connectors by agent type
+        self._permission_manager = permission_manager or get_permission_manager()
+        self._permission_callback = permission_callback
+        self._current_skill_context: Optional[Dict[str, Any]] = None
+        self._subagent_seq = 0  # Incremental id for subagent runs
         
         # Initialize compaction manager for subagent context management
         # Use config_manager settings if available, otherwise use defaults
@@ -188,7 +195,26 @@ class TaskTool(BaseTool):
     def set_parent_agent_name(self, name: str) -> None:
         """Set the parent agent name for nested display."""
         self._parent_agent_name = name
+
+    def set_permission_manager(self, manager) -> None:
+        """Set the permission manager for subagent tool execution."""
+        self._permission_manager = manager
+
+    def set_permission_callback(self, callback) -> None:
+        """Set the permission callback for subagent tool execution."""
+        self._permission_callback = callback
     
+    def _next_subagent_run_id(self) -> str:
+        """Generate a unique id for a subagent run."""
+        self._subagent_seq += 1
+        return f"subagent-{self._subagent_seq}"
+
+    def _build_display_name(self, parent_name: Optional[str], agent_type: str) -> str:
+        """Build display name with nesting path."""
+        if parent_name:
+            return f"{parent_name}---{agent_type}"
+        return agent_type
+
     def _emit_event(self, event_type: EventType, data: Any = None) -> None:
         """Emit an event through the event bus."""
         if self._event_bus:
@@ -231,11 +257,19 @@ class TaskTool(BaseTool):
                 error="No model connector configured for subagent execution"
             )
         
-        # 构建子代理显示名称
-        if self._parent_agent_name:
-            display_name = f"{self._parent_agent_name}---{agent_type}"
-        else:
-            display_name = agent_type
+        # 构建子代理显示名称（支持多级嵌套）
+        parent_name = self._parent_agent_name
+        display_name = self._build_display_name(parent_name, agent_type)
+        subagent_run_id = self._next_subagent_run_id()
+
+        # Emit subagent start event (for UI display)
+        self._emit_event(EventType.AGENT_SUBAGENT_START, {
+            "agent_name": agent_type,
+            "description": description,
+            "parent_agent": parent_name,
+            "agent_run_id": subagent_run_id,
+            "agent_display_name": display_name,
+        })
         
         # Get agent configuration
         agent_config = None
@@ -270,12 +304,20 @@ class TaskTool(BaseTool):
         last_content = ""  # 追踪上次发送的内容，避免重复
         step = 0
         
+        previous_parent_name = self._parent_agent_name
+        self._parent_agent_name = display_name
+
         try:
             while True:
                 if normalized_max_steps is not None and step >= normalized_max_steps:
                     break
                 # Call model with the appropriate connector for this agent type
-                response = self._call_model(messages, display_name, model_connector)
+                response = self._call_model(
+                    messages,
+                    display_name,
+                    model_connector,
+                    agent_run_id=subagent_run_id,
+                )
                 
                 if response.is_error:
                     # 发出子代理结束事件
@@ -283,7 +325,9 @@ class TaskTool(BaseTool):
                         "agent_name": agent_type,
                         "success": False,
                         "output": response.error_message,
-                        "parent_agent": self._parent_agent_name,
+                        "parent_agent": parent_name,
+                        "agent_run_id": subagent_run_id,
+                        "agent_display_name": display_name,
                     })
                     return ToolResult(
                         success=False,
@@ -319,11 +363,12 @@ class TaskTool(BaseTool):
                         "tool_call_id": tool_call.get("id", ""),
                         "args": tool_args,
                         "agent_name": display_name,
+                        "agent_run_id": subagent_run_id,
                     })
                     
                     # Execute tool
                     if self._tool_registry:
-                        result = self._tool_registry.execute(tool_name, **tool_args)
+                        result = self._execute_tool_with_permissions(tool_name, tool_args)
                         tool_results.append({
                             "tool_call_id": tool_call.get("id", ""),
                             "result": result.output if result.success else f"Error: {result.error}"
@@ -337,6 +382,7 @@ class TaskTool(BaseTool):
                             "result": result.output if result.success else f"Error: {result.error}",
                             "success": result.success,
                             "agent_name": display_name,
+                            "agent_run_id": subagent_run_id,
                         })
                 
                 # Add assistant message and tool results
@@ -375,7 +421,9 @@ class TaskTool(BaseTool):
                 "agent_name": agent_type,
                 "success": True,
                 "output": final_output[:300] if final_output else "",
-                "parent_agent": self._parent_agent_name,
+                "parent_agent": parent_name,
+                "agent_run_id": subagent_run_id,
+                "agent_display_name": display_name,
             })
             
             return ToolResult(
@@ -396,13 +444,139 @@ class TaskTool(BaseTool):
                 "agent_name": agent_type,
                 "success": False,
                 "output": str(e),
-                "parent_agent": self._parent_agent_name,
+                "parent_agent": parent_name,
+                "agent_run_id": subagent_run_id,
+                "agent_display_name": display_name,
             })
             return ToolResult(
                 success=False,
                 output="",
                 error=f"Subagent execution error: {str(e)}"
             )
+        finally:
+            self._parent_agent_name = previous_parent_name
+
+    def _request_permission(
+        self,
+        permission_type: PermissionType,
+        metadata: Dict[str, Any],
+    ) -> Tuple[bool, Optional[str]]:
+        """Request permission and return (granted, error_message)."""
+        if not self._permission_manager:
+            return True, None
+        
+        if self._permission_manager.has_session_permission(permission_type):
+            return True, None
+        
+        if not self._permission_callback:
+            return False, "Permission denied (no callback set)"
+        
+        callback_result = self._permission_callback(permission_type.value, metadata)
+        if isinstance(callback_result, tuple):
+            response, reason = callback_result
+        else:
+            response, reason = callback_result, None
+        
+        if isinstance(response, PermissionResponse):
+            response = response.value
+        
+        response_str = str(response).lower() if response is not None else ""
+        
+        if response_str == "always":
+            self._permission_manager.grant_session_permission(permission_type)
+            return True, None
+        if response_str == "once":
+            return True, None
+        
+        if reason and str(reason).strip():
+            return False, f"操作被用户拒绝 - {reason}"
+        return False, "用户拒绝操作且未提供理由"
+    
+    def _execute_tool_with_permissions(
+        self,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+    ) -> ToolResult:
+        """Execute a tool with permission checks (write/edit/bash)."""
+        if not self._tool_registry:
+            return ToolResult(
+                success=False,
+                output="",
+                error="Tool registry not available"
+            )
+        
+        tool = self._tool_registry.get(tool_name)
+        if tool is None:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Tool '{tool_name}' not found"
+            )
+        
+        # Track skill context for bash commands
+        if tool_name == "Skill":
+            result = self._tool_registry.execute(tool_name, **tool_args)
+            if result.metadata and result.metadata.get("skill_dir"):
+                self._current_skill_context = {
+                    "skill_name": result.metadata.get("skill_name"),
+                    "skill_dir": result.metadata.get("skill_dir"),
+                }
+            return result
+        
+        # Special handling for bash with skill context
+        if tool_name == "bash" and self._current_skill_context and hasattr(tool, "execute_with_skill_context"):
+            result = tool.execute_with_skill_context(
+                command=tool_args.get("command", ""),
+                timeout=tool_args.get("timeout", 60),
+                cwd=tool_args.get("cwd"),
+                skill_dir=self._current_skill_context.get("skill_dir"),
+            )
+        else:
+            result = self._tool_registry.execute(tool_name, **tool_args)
+        
+        # If tool doesn't require permission, return directly
+        if not getattr(tool, "requires_permission", False):
+            return result
+        
+        # If preview failed or no permission required, return as-is
+        if not result.metadata or not result.metadata.get("requires_permission"):
+            return result
+        
+        # Determine permission type
+        permission_type = None
+        if tool_name == "write":
+            permission_type = PermissionType.WRITE
+        elif tool_name == "edit":
+            permission_type = PermissionType.EDIT
+        elif tool_name == "bash":
+            permission_type = PermissionType.BASH_DELETE if result.metadata.get("has_delete") else PermissionType.BASH
+        
+        if permission_type:
+            granted, error_msg = self._request_permission(permission_type, result.metadata)
+            if not granted:
+                return ToolResult(success=False, output="", error=error_msg)
+        
+        # Permission granted - execute actual operation
+        if tool_name == "write" and hasattr(tool, "execute_with_permission"):
+            return tool.execute_with_permission(
+                file_path=result.metadata.get("file_path"),
+                content=result.metadata.get("content"),
+                encoding=result.metadata.get("encoding", "utf-8"),
+            )
+        if tool_name == "edit" and hasattr(tool, "execute_with_permission"):
+            return tool.execute_with_permission(
+                file_path=result.metadata.get("file_path"),
+                new_content=result.metadata.get("new_content"),
+                encoding=result.metadata.get("encoding", "utf-8"),
+            )
+        if tool_name == "bash" and hasattr(tool, "execute_with_permission"):
+            return tool.execute_with_permission(
+                command=result.metadata.get("command"),
+                timeout=result.metadata.get("timeout", 60),
+                cwd=result.metadata.get("cwd"),
+            )
+        
+        return result
     
     def _build_system_prompt(self, agent_type: str, agent_config) -> str:
         """Build system prompt for subagent."""
@@ -413,7 +587,13 @@ class TaskTool(BaseTool):
         
         return base_prompt + "\n\nComplete the task and return a clear, concise summary."
     
-    def _call_model(self, messages: List[Dict], agent_name: str = None, model_connector=None) -> Any:
+    def _call_model(
+        self,
+        messages: List[Dict],
+        agent_name: str = None,
+        model_connector=None,
+        agent_run_id: Optional[str] = None,
+    ) -> Any:
         """
         Call the model with messages.
         
@@ -421,6 +601,7 @@ class TaskTool(BaseTool):
             messages: List of message dictionaries
             agent_name: Agent name for display (optional)
             model_connector: Model connector to use (defaults to self._model_connector)
+            agent_run_id: Subagent run id for display grouping (optional)
             
         Returns:
             Response object with is_error, error_message, content, thinking, tool_calls
@@ -460,6 +641,7 @@ class TaskTool(BaseTool):
                     self._emit_event(EventType.MODEL_ANSWER, {
                         "content": response.content,
                         "agent_name": agent_name,
+                        "agent_run_id": agent_run_id,
                     })
                 if response.thinking:
                     full_thinking += response.thinking

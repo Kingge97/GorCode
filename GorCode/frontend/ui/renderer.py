@@ -59,10 +59,12 @@ class UIRenderer:
         self._thinking_panel = None
         self._is_thinking = False  # Track if we're in thinking mode
         self._is_answering = False  # Track if we're in answering mode
-        self._current_agent_name = None  # Current agent name for display
+        self._current_agent_key = None  # Current agent key for display grouping
         self._pending_tool_args = None  # Pending tool arguments for display
         self._diff_preview_max_lines = getattr(config, "permission_diff_max_lines", 100)
         self._diff_page_max_lines = getattr(config, "permission_diff_page_lines", 100)
+        self._agent_run_labels: Dict[str, str] = {}  # run_id -> display label
+        self._agent_label_counts: Dict[str, int] = {}  # display_name -> count
     
     def render_event(self, event: Event) -> None:
         """
@@ -108,7 +110,7 @@ class UIRenderer:
     def _render_answer(self, event: Event) -> None:
         """Render answer event."""
         content = event.data.get("content", "") if event.data else ""
-        agent_name = event.data.get("agent_name", None) if event.data else None
+        agent_label, agent_key, indent = self._resolve_agent_display(event.data or {})
         
         # Close thinking section if we were in thinking mode
         if self._is_thinking:
@@ -116,18 +118,21 @@ class UIRenderer:
             self._is_thinking = False
         
         # 检查是否切换了代理，需要重置状态
-        if agent_name != self._current_agent_name:
+        if agent_key != self._current_agent_key:
             if self._is_answering:
                 self.console.print()  # 结束上一个代理的输出
             self._is_answering = False
-            self._current_agent_name = agent_name
+            self._current_agent_key = agent_key
         
         # Print header once when starting answer
         if not self._is_answering:
             self.console.print()
             # 显示代理名前缀
-            if agent_name:
-                self.console.print(f"[bold cyan][{agent_name}][/bold cyan]")
+            if agent_label:
+                if indent:
+                    self.console.print(f"{indent}[bold cyan][{agent_label}][/bold cyan]")
+                else:
+                    self.console.print(f"[bold cyan][{agent_label}][/bold cyan]")
             self._is_answering = True
         
         # Print answer content
@@ -185,19 +190,7 @@ class UIRenderer:
         
         # Task 工具特殊处理：显示为"启动子代理"
         if tool_name.lower() in self.SUBAGENT_TOOLS:
-            description = args.get("description", "") if isinstance(args, dict) else ""
-            subagent_type = args.get("agent_type", "unknown") if isinstance(args, dict) else "unknown"
-            
-            # 构建显示名称
-            if agent_name:
-                display_name = f"{agent_name}---{subagent_type}"
-            else:
-                display_name = subagent_type
-            
-            self.console.print()
-            self.console.print(f"[bold magenta]▶ 启动子代理:[/bold magenta] [bold]{display_name}[/bold]")
-            if description:
-                self.console.print(f"[dim]任务: {description}[/dim]")
+            # 子代理启动由 AGENT_SUBAGENT_START 事件统一处理
             return
         
         # 普通工具调用不在 toolcall 阶段显示，等 executing 阶段统一显示
@@ -212,6 +205,7 @@ class UIRenderer:
             self._is_thinking = False
         if self._is_answering:
             self._is_answering = False
+        self._current_agent_key = None
         
         self.console.print()
         self.console.print("[dim]─" * 40 + " End " + "─" * 40 + "[/dim]")
@@ -222,6 +216,8 @@ class UIRenderer:
         # Reset state flags
         self._is_thinking = False
         self._is_answering = False
+        self._current_agent_key = None
+        self._current_agent_key = None
         
         error = event.data.get("error", "Unknown error") if event.data else "Unknown error"
         self.console.print()
@@ -302,6 +298,10 @@ class UIRenderer:
                 self.console.print(f"[red]✗[/red] [dim]{tool_name}[/dim] 执行失败: {error_msg}")
             return
         
+        # Normalize non-string results (e.g., MCP image content list)
+        if not isinstance(result, str):
+            result = self._stringify_tool_result(result)
+        
         # Truncate long results
         if len(result) > 500:
             result = result[:500] + "..."
@@ -314,6 +314,40 @@ class UIRenderer:
             self.console.print(f"[bold cyan][{agent_name}][/bold cyan] ", end="")
         self.console.print("[green]Result:[/green] ", end="")
         self.console.print(result_text)
+
+    def _stringify_tool_result(self, result: Any) -> str:
+        """Convert non-string tool results into a safe, printable string."""
+        try:
+            sanitized = self._sanitize_tool_result(result)
+            if isinstance(sanitized, (dict, list)):
+                return json.dumps(sanitized, ensure_ascii=False)
+            return str(sanitized)
+        except Exception:
+            return str(result)
+
+    def _sanitize_tool_result(self, data: Any) -> Any:
+        """Sanitize tool results to avoid dumping huge data URLs."""
+        if isinstance(data, list):
+            return [self._sanitize_tool_result(item) for item in data]
+        if isinstance(data, dict):
+            # MCP image response: {"type":"image_url","image_url":{"url":"data:..."}}
+            if data.get("type") == "image_url" and isinstance(data.get("image_url"), dict):
+                url = data.get("image_url", {}).get("url", "")
+                if isinstance(url, str) and url.startswith("data:"):
+                    return {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"<data_url {len(url)} chars>"
+                        },
+                    }
+            sanitized: Dict[str, Any] = {}
+            for key, value in data.items():
+                if key == "url" and isinstance(value, str) and value.startswith("data:"):
+                    sanitized[key] = f"<data_url {len(value)} chars>"
+                else:
+                    sanitized[key] = self._sanitize_tool_result(value)
+            return sanitized
+        return data
     
     def _render_agent_switch(self, event: Event) -> None:
         """Render agent switch event."""
@@ -332,20 +366,33 @@ class UIRenderer:
         agent_name = event.data.get("agent_name", "unknown")
         description = event.data.get("description", "")
         parent_agent = event.data.get("parent_agent", "")
+        agent_run_id = event.data.get("agent_run_id")
+        agent_display_name = event.data.get("agent_display_name")
         
         # 构建显示名称：如果有父代理，则显示为 "父代理---子代理"
-        if parent_agent:
+        if agent_display_name:
+            display_name = agent_display_name
+        elif parent_agent:
             display_name = f"{parent_agent}---{agent_name}"
         else:
             display_name = agent_name
         
+        agent_label = self._get_agent_label(agent_run_id, display_name)
+        indent = self._get_indent(display_name)
+        
         self.console.print()
-        self.console.print(f"[bold magenta]▶ 启动子代理:[/bold magenta] [bold]{display_name}[/bold]")
+        if indent:
+            self.console.print(f"{indent}[bold magenta]▶ 启动子代理:[/bold magenta] [bold]{agent_label}[/bold]")
+        else:
+            self.console.print(f"[bold magenta]▶ 启动子代理:[/bold magenta] [bold]{agent_label}[/bold]")
         if description:
-            self.console.print(f"[dim]任务: {description}[/dim]")
+            if indent:
+                self.console.print(f"{indent}[dim]任务: {description}[/dim]")
+            else:
+                self.console.print(f"[dim]任务: {description}[/dim]")
         
         # 更新当前代理名
-        self._current_agent_name = display_name
+        self._current_agent_key = agent_run_id or display_name
     
     def _render_subagent_end(self, event: Event) -> None:
         """Render subagent end event."""
@@ -356,18 +403,31 @@ class UIRenderer:
         success = event.data.get("success", True)
         output = event.data.get("output", "")
         parent_agent = event.data.get("parent_agent", "")
+        agent_run_id = event.data.get("agent_run_id")
+        agent_display_name = event.data.get("agent_display_name")
         
         # 构建显示名称
-        if parent_agent:
+        if agent_display_name:
+            display_name = agent_display_name
+        elif parent_agent:
             display_name = f"{parent_agent}---{agent_name}"
         else:
             display_name = agent_name
         
+        agent_label = self._get_agent_label(agent_run_id, display_name)
+        indent = self._get_indent(display_name)
+        
         self.console.print()
         if success:
-            self.console.print(f"[bold green]✓ 子代理完成:[/bold green] [bold]{display_name}[/bold]")
+            if indent:
+                self.console.print(f"{indent}[bold green]✓ 子代理完成:[/bold green] [bold]{agent_label}[/bold]")
+            else:
+                self.console.print(f"[bold green]✓ 子代理完成:[/bold green] [bold]{agent_label}[/bold]")
         else:
-            self.console.print(f"[bold red]✗ 子代理失败:[/bold red] [bold]{display_name}[/bold]")
+            if indent:
+                self.console.print(f"{indent}[bold red]✗ 子代理失败:[/bold red] [bold]{agent_label}[/bold]")
+            else:
+                self.console.print(f"[bold red]✗ 子代理失败:[/bold red] [bold]{agent_label}[/bold]")
         
         # 显示子代理输出摘要（如果有）
         if output:
@@ -376,8 +436,45 @@ class UIRenderer:
                 output = output[:500] + "..."
             self.console.print()
             # 显示代理名前缀
-            self.console.print(f"[bold cyan][{display_name}][/bold cyan]")
+            if indent:
+                self.console.print(f"{indent}[bold cyan][{agent_label}][/bold cyan]")
+            else:
+                self.console.print(f"[bold cyan][{agent_label}][/bold cyan]")
             self.console.print(output)
+    
+    def _get_indent(self, display_name: str) -> str:
+        """Get indentation for nested subagent display."""
+        if not display_name:
+            return ""
+        depth = display_name.count("---")
+        if depth <= 0:
+            return ""
+        return "  " * depth
+    
+    def _get_agent_label(self, run_id: Optional[str], display_name: str) -> str:
+        """Resolve a stable display label for a subagent run."""
+        if not display_name:
+            return "unknown"
+        if not run_id:
+            return display_name
+        existing = self._agent_run_labels.get(run_id)
+        if existing:
+            return existing
+        count = self._agent_label_counts.get(display_name, 0) + 1
+        self._agent_label_counts[display_name] = count
+        label = f"{display_name}#{count}" if count > 1 else display_name
+        self._agent_run_labels[run_id] = label
+        return label
+    
+    def _resolve_agent_display(self, data: Dict[str, Any]) -> tuple:
+        """Resolve agent label, key, and indent for display."""
+        agent_name = data.get("agent_name")
+        display_name = data.get("agent_display_name") or agent_name
+        run_id = data.get("agent_run_id")
+        label = self._get_agent_label(run_id, display_name) if display_name else None
+        indent = self._get_indent(display_name or "")
+        agent_key = run_id or display_name
+        return label, agent_key, indent
     
     def _render_message(self, event: Event) -> None:
         """Render UI message event."""

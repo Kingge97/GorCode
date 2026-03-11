@@ -7,6 +7,7 @@ Main entry point for GorCode CLI using Click.
 
 import sys
 import os
+import json
 from pathlib import Path
 from typing import Optional
 
@@ -18,14 +19,16 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 
-# Add project root to path for imports
-_project_root = Path(__file__).parent.parent.parent
-if str(_project_root) not in sys.path:
-    sys.path.insert(0, str(_project_root))
+# Add repo root and GorCode dir to path for imports
+_repo_root = Path(__file__).resolve().parent.parent.parent.parent
+_gorcode_dir = _repo_root / "GorCode"
+for _p in (str(_repo_root), str(_gorcode_dir)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from backend.core.events import EventBus, Event, EventType
 from backend.core.executor import BackendExecutor
-from backend.config.manager import ConfigManager
+from backend.config.manager import ConfigManager, GorCodeConfig
 from frontend.ui.renderer import UIRenderer
 from frontend.commands.handler import CommandHandler
 
@@ -51,14 +54,19 @@ def print_welcome():
     title.append("GorCode", style="bold cyan")
     title.append(f" v{version}", style="dim")
     
-    subtitle = Text()
-    subtitle.append("AI-Powered CLI Coding Assistant", style="italic dim")
+    subtitle_plain = "AI-Powered CLI"
+    subtitle = f"[italic dim]{subtitle_plain}[/]"
+    # Ensure the title renderable is wide enough for the subtitle on the border.
+    pad_needed = max(0, (len(subtitle_plain) + 1) - len(title.plain))
+    if pad_needed:
+        title.append(" " * pad_needed)
     
     console.print()
-    console.print(Panel.fit(
+    console.print(Panel(
         title,
         subtitle=subtitle,
         border_style="cyan",
+        expand=False,
     ))
     console.print()
     console.print("[dim]Type[/dim] [bold]/help[/bold] [dim]for available commands, or start chatting.[/dim]")
@@ -73,13 +81,65 @@ def print_goodbye():
     console.print()
 
 
+def _has_valid_model_connections(config: GorCodeConfig) -> bool:
+    """Check if config contains at least one usable model connection."""
+    if not config.model_connections:
+        return False
+    for conn in config.model_connections.values():
+        if not conn:
+            continue
+        api_key = (conn.api_key or "").strip()
+        base_url = (conn.base_url or "").strip()
+        model_name = (conn.model_name or "").strip()
+        if api_key and api_key != "YOUR_API_KEY_HERE" and base_url and model_name:
+            return True
+    return False
+
+
+def _ensure_user_config_ready(config_manager: ConfigManager) -> bool:
+    """Ensure user config exists and has usable connections before startup."""
+    user_config_path = config_manager.get_user_config_path()
+    if not user_config_path.exists():
+        console.print("[yellow]User config not found. Creating default config...[/yellow]")
+        created = config_manager.initialize_user_config()
+        if not created:
+            console.print("[red]Failed to create default user config:[/red]")
+            console.print(f"[dim]{user_config_path}[/dim]")
+            console.print("[dim]Please create and configure it, then restart GorCode.[/dim]")
+            return False
+        console.print("[green]Default user config created:[/green]")
+        console.print(f"[dim]{user_config_path}[/dim]")
+        console.print("[dim]Please configure your connections and restart GorCode.[/dim]")
+        return False
+    try:
+        with open(user_config_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        user_config = GorCodeConfig.from_dict(data)
+    except (json.JSONDecodeError, OSError) as e:
+        console.print("[red]Failed to read user config:[/red]")
+        console.print(f"[dim]{user_config_path}[/dim]")
+        console.print(f"[dim]Error: {e}[/dim]")
+        console.print("[dim]Please fix the config and restart GorCode.[/dim]")
+        return False
+    if not _has_valid_model_connections(user_config):
+        console.print("[yellow]No usable model connections found[/yellow]")
+        console.print(f"[dim]Please configure at least one connection in {user_config_path} and restart GorCode.[/dim]")
+        return False
+    return True
+
+
 @click.group(invoke_without_command=True)
 @click.option("--version", "-v", is_flag=True, help="Show version and exit")
 @click.option("--debug", "-d", is_flag=True, help="Enable debug mode")
 @click.option("--config", "-c", type=click.Path(), help="Path to config file")
-@click.option("--agent", "-a", type=str, default="build", help="Default agent to use")
+@click.option("--agent", "-a", type=str, default=None, help="Default agent to use (overrides config)")
 @click.option("--model", "-m", type=str, help="Model connection name to use")
 @click.option("--prompt", "-p", type=str, help="Run a single prompt and exit")
+@click.option(
+    "--mcps",
+    multiple=True,
+    help="Run MCP command(s) before prompt/REPL (same syntax as /mcps)",
+)
 @click.option(
     "--permission",
     type=click.Choice(["ask", "all", "exceptrm"], case_sensitive=False),
@@ -93,9 +153,10 @@ def cli(
     version: bool,
     debug: bool,
     config: Optional[str],
-    agent: str,
+    agent: Optional[str],
     model: Optional[str],
     prompt: Optional[str],
+    mcps: tuple,
     permission: str,
 ):
     """
@@ -116,6 +177,7 @@ def cli(
             agent=agent,
             model=model,
             prompt=prompt,
+            mcps=mcps,
             permission=permission,
         )
 
@@ -123,9 +185,14 @@ def cli(
 @cli.command()
 @click.option("--debug", "-d", is_flag=True, help="Enable debug mode")
 @click.option("--config-path", "-c", type=click.Path(), help="Path to config file")
-@click.option("--agent", "-a", type=str, default="build", help="Default agent to use")
+@click.option("--agent", "-a", type=str, default=None, help="Default agent to use (overrides config)")
 @click.option("--model", "-m", type=str, help="Model connection name to use")
 @click.option("--prompt", "-p", type=str, help="Run a single prompt and exit")
+@click.option(
+    "--mcps",
+    multiple=True,
+    help="Run MCP command(s) before prompt/REPL (same syntax as /mcps)",
+)
 @click.option(
     "--permission",
     type=click.Choice(["ask", "all", "exceptrm"], case_sensitive=False),
@@ -136,25 +203,28 @@ def cli(
 def run(
     debug: bool,
     config_path: Optional[str],
-    agent: str,
+    agent: Optional[str],
     model: Optional[str],
     prompt: Optional[str],
+    mcps: tuple,
     permission: str,
 ):
     """Run GorCode in interactive mode."""
+    config_manager = ConfigManager(config_path=config_path)
+    if not _ensure_user_config_ready(config_manager):
+        return
     print_welcome()
     
     # Initialize components
     event_bus = EventBus()
     executor = BackendExecutor(event_bus)
-    config_manager = ConfigManager(config_path=config_path)
     
     # 订阅 EventBus 事件，让渲染器能接收子代理等事件
     # 子代理的事件通过 EventBus 发送，主代理的事件通过 yield 返回
     def setup_event_subscriptions():
         """Setup event subscriptions for the renderer."""
-        # 子代理启动由主代理的 TOOL_CALL 事件处理（在 _render_tool_call 中）
-        # 只订阅子代理结束事件和内部工具事件
+        # 订阅子代理启动/结束事件
+        event_bus.subscribe(EventType.AGENT_SUBAGENT_START, ui_renderer.render_event)
         event_bus.subscribe(EventType.AGENT_SUBAGENT_END, ui_renderer.render_event)
         # 订阅子代理的工具事件
         event_bus.subscribe(EventType.TOOL_EXECUTION_START, ui_renderer.render_event)
@@ -165,6 +235,8 @@ def run(
         event_bus.subscribe(EventType.UI_MESSAGE, ui_renderer.render_event)
     
     config = config_manager.load_config()
+    # If --agent not provided, fall back to config default_agent
+    agent = agent or config.default_agent or "build"
     if debug:
         config.debug_mode = True
     
@@ -230,6 +302,20 @@ def run(
     executor.set_reconnect_callback(reconnect_callback)
     
     command_handler = CommandHandler(executor, config_manager, ui_renderer)
+
+    # Run MCP commands from CLI before prompt/REPL
+    if mcps:
+        for mcp_cmd in mcps:
+            cmd = (mcp_cmd or "").strip()
+            if not cmd:
+                continue
+            if cmd.startswith("/"):
+                command = cmd
+            elif cmd.lower().startswith("mcps"):
+                command = f"/{cmd}"
+            else:
+                command = f"/mcps {cmd}"
+            command_handler.handle(command)
     
     # Try to switch to default agent (this will use agent_model_mapping to select the correct model)
     if agent_registry.get(agent):
