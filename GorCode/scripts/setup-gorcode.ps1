@@ -8,10 +8,34 @@ $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Resolve-Path (Join-Path $scriptDir "..")
 $launcher = Join-Path $repoRoot "run_gorcode.py"
+$gorConfigCreate = Join-Path $scriptDir "gorconfig_create.py"
+$rgDownload = Join-Path $scriptDir "rg_download.py"
 
 if (-not (Test-Path $launcher)) {
     Write-Error "Launcher not found: $launcher"
     exit 1
+}
+
+if (-not (Test-Path $gorConfigCreate)) {
+    Write-Error "Script not found: $gorConfigCreate"
+    exit 1
+}
+
+if (-not (Test-Path $rgDownload)) {
+    Write-Error "Script not found: $rgDownload"
+    exit 1
+}
+
+Write-Host "Creating default ~/.gorcode configuration..."
+& python $gorConfigCreate
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+
+Write-Host "Downloading ripgrep into ~/.gorcode/gorpath/path..."
+& python $rgDownload
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
 }
 
 $binDir = Join-Path $env:LOCALAPPDATA "GorCode\\bin"

@@ -11,7 +11,8 @@ in-memory task tracking system that helps the model organize complex work.
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 
-from .base import BaseTool, ToolResult, ToolDefinition
+from .core_tool_support.base import BaseTool, ToolResult
+from .core_tool_support.tool_utils import build_parameters_schema, tool_error_result
 
 
 @dataclass
@@ -191,23 +192,16 @@ class TodoTool(BaseTool):
                 }
             )
         except ValueError as e:
-            return ToolResult(
-                success=False,
+            return tool_error_result(
+                e,
                 output=TodoTool._manager.render() if TodoTool._manager.items else "No todos.",
-                error=str(e)
             )
         except Exception as e:
-            return ToolResult(
-                success=False,
-                output="",
-                error=f"Todo update failed: {str(e)}"
-            )
+            return tool_error_result(e, prefix="Todo update failed: ")
     
-    def get_definition(self) -> ToolDefinition:
-        """Get tool definition for model API."""
-        return ToolDefinition(
-            name=self.name,
-            description="""Update the task list to track multi-step work progress.
+    def get_description(self) -> str:
+        """Get tool description for model API."""
+        return """Update the task list to track multi-step work progress.
 
 Use this tool when:
 1. Starting a complex multi-step task - initialize the todo list
@@ -228,37 +222,37 @@ Example:
   {"content": "Read configuration files", "status": "completed", "activeForm": "Reading config"},
   {"content": "Implement feature X", "status": "in_progress", "activeForm": "Implementing feature X"},
   {"content": "Write tests", "status": "pending", "activeForm": "Writing tests"}
-]""",
-            parameters={
-                "type": "object",
-                "properties": {
+]"""
+
+    def get_parameters(self) -> Dict[str, Any]:
+        """Get tool parameter schema."""
+        return build_parameters_schema(
+            properties={
+                "items": {
+                    "type": "array",
+                    "description": "List of tasks to track",
                     "items": {
-                        "type": "array",
-                        "description": "List of tasks to track",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "content": {
-                                    "type": "string",
-                                    "description": "Task description"
-                                },
-                                "status": {
-                                    "type": "string",
-                                    "enum": ["pending", "in_progress", "completed"],
-                                    "description": "Task status"
-                                },
-                                "activeForm": {
-                                    "type": "string",
-                                    "description": "Active form description for LLM context"
-                                }
+                        "type": "object",
+                        "properties": {
+                            "content": {
+                                "type": "string",
+                                "description": "Task description"
                             },
-                            "required": ["content", "status", "activeForm"]
-                        }
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"],
+                                "description": "Task status"
+                            },
+                            "activeForm": {
+                                "type": "string",
+                                "description": "Active form description for LLM context"
+                            }
+                        },
+                        "required": ["content", "status", "activeForm"]
                     }
-                },
-                "required": ["items"]
+                }
             },
-            category=self.category,
+            required=["items"],
         )
     
     @classmethod

@@ -7,6 +7,7 @@ Cross-platform encoding handling utilities.
 
 import locale
 import sys
+from pathlib import Path
 from typing import Optional, Tuple
 
 from .detector import PlatformDetector
@@ -273,3 +274,31 @@ def get_preferred_encoding() -> str:
 def setup_utf8() -> None:
     """Set up UTF-8 as default encoding."""
     _encoding_utils.setup_utf8_default()
+
+
+def read_text_with_fallback(path: Path, encoding: Optional[str] = None) -> Optional[str]:
+    """
+    Read file text with encoding fallback support.
+
+    Args:
+        path: File path to read
+        encoding: Preferred encoding to try first
+
+    Returns:
+        File content as string, or None on read failure
+    """
+    try:
+        data = path.read_bytes()
+    except Exception:
+        return None
+
+    if encoding:
+        try:
+            return data.decode(encoding)
+        except (UnicodeDecodeError, UnicodeError):
+            pass
+
+    try:
+        return _encoding_utils.decode(data)
+    except Exception:
+        return None

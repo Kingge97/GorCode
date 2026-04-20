@@ -418,6 +418,10 @@ class SessionManager:
     def get_session_count(self) -> int:
         """Get total session count."""
         return self.storage.count()
+
+    def list_session_ids(self) -> List[str]:
+        """List all stored session IDs."""
+        return self.storage.list_session_ids()
     
     # ========================
     # Utility Methods

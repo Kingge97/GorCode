@@ -12,6 +12,8 @@ from enum import Enum
 import os
 from pathlib import Path
 
+from ..utils.serialization import dataclass_to_dict
+
 
 class AgentMode(Enum):
     """Agent mode types."""
@@ -40,14 +42,7 @@ class AgentPermission:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
-        return {
-            "edit": self.edit.value,
-            "bash": {k: v.value for k, v in self.bash.items()},
-            "skill": {k: v.value for k, v in self.skill.items()},
-            "webfetch": self.webfetch.value,
-            "doom_loop": self.doom_loop.value,
-            "external_directory": self.external_directory.value,
-        }
+        return dataclass_to_dict(self)
 
 
 @dataclass
@@ -77,20 +72,7 @@ class AgentInfo:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
-        return {
-            "name": self.name,
-            "description": self.description,
-            "mode": self.mode.value,
-            "is_native": self.is_native,
-            "is_hidden": self.is_hidden,
-            "is_default": self.is_default,
-            "prompt": self.prompt,
-            "tools": self.tools,
-            "allowsubagents": self.allowsubagents,
-            "permissions": self.permissions.to_dict(),
-            "model_config": self.model_config,
-            "parent": self.parent,
-        }
+        return dataclass_to_dict(self)
 
 
 class BaseAgent(ABC):

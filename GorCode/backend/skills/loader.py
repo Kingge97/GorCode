@@ -5,14 +5,15 @@ Skill Module
 Skill system for GorCode - provides knowledge injection and specialized capabilities.
 """
 
-import os
 import re
-import yaml
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-import fnmatch
 
+from ..utils.frontmatter import parse_yaml_frontmatter
+from ..utils.loader_helpers import discover_dirs_with_file, read_text_file
+from ..utils.loader_base import DiscoveredItem, LoaderBase
+from ..utils.serialization import dataclass_to_dict
 
 @dataclass
 class SkillResource:
@@ -79,17 +80,14 @@ class Skill:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary representation."""
-        return {
-            "name": self.name,
-            "path": str(self.path),
-            "description": self.description,
-            "enabled": self.enabled,
-            "resource_count": len(self.resources),
-            "metadata": self.metadata,
-        }
+        return dataclass_to_dict(
+            self,
+            exclude_fields={"content", "resources"},
+            extra_fields={"resource_count": lambda skill: len(skill.resources)},
+        )
 
 
-class SkillLoader:
+class SkillLoader(LoaderBase[Skill]):
     """
     Loader for skills from directories.
     
@@ -109,7 +107,7 @@ class SkillLoader:
     SKILL_FILE = "SKILL.md"
     SKILL_PATTERN = re.compile(r"^#\s*(.+)$", re.MULTILINE)
     DESCRIPTION_PATTERN = re.compile(r"^#\s+.+\n+(.+?)(?:\n\n|\n#|$)", re.MULTILINE | re.DOTALL)
-    YAML_FRONTMATTER_PATTERN = re.compile(r'^---\s*\n(.*?)\n---\s*\n(.*)$', re.DOTALL)
+    # YAML frontmatter parsing is handled by utils.frontmatter
     
     def __init__(self, encoding: str = "utf-8"):
         """
@@ -118,9 +116,8 @@ class SkillLoader:
         Args:
             encoding: Default encoding for reading files
         """
-        self.encoding = encoding
-        self._skills: Dict[str, Skill] = {}
-        self._search_paths: List[Path] = []
+        super().__init__(encoding=encoding)
+        self._skills: Dict[str, Skill] = self._items
         self._skill_sources: Dict[str, Path] = {}  # Track skill source directories
     
     def add_search_path(self, path: str) -> None:
@@ -135,84 +132,37 @@ class SkillLoader:
         Args:
             path: Directory path or redirect file to search
         """
-        path = Path(path)
-        
-        if not path.exists():
-            return
-        
-        # Check if it's a file (potential redirect file like .claude/skills)
-        if path.is_file():
-            resolved = self._resolve_redirect_file(path)
-            if resolved and resolved not in self._search_paths:
-                self._search_paths.append(resolved)
-                print(f"[SkillLoader] Resolved redirect: {path} -> {resolved}")
-            return
-        
-        # Check if it's a symlink
-        if path.is_symlink():
-            resolved = path.resolve()
-            if resolved.exists() and resolved not in self._search_paths:
-                self._search_paths.append(resolved)
-                print(f"[SkillLoader] Resolved symlink: {path} -> {resolved}")
-            return
-        
-        # Regular directory
-        if path.is_dir() and path not in self._search_paths:
-            self._search_paths.append(path)
+        resolved = self._add_search_path(
+            path,
+            allow_redirect=True,
+            allow_symlink=True,
+        )
+        if resolved:
+            if resolved.resolution == "redirect":
+                print(f"[SkillLoader] Resolved redirect: {resolved.source} -> {resolved.path}")
+            elif resolved.resolution == "symlink":
+                print(f"[SkillLoader] Resolved symlink: {resolved.source} -> {resolved.path}")
     
-    def _resolve_redirect_file(self, redirect_file: Path) -> Optional[Path]:
+    def _discover_items(self) -> List[DiscoveredItem]:
         """
-        Resolve a redirect file to its target directory.
-        
-        Redirect files contain a relative path to the actual skills directory.
-        Example: .claude/skills file contains "../.codex/skills"
-        
-        Args:
-            redirect_file: Path to the redirect file
-            
-        Returns:
-            Resolved target directory or None if invalid
+        Discover all skills in search paths.
         """
-        try:
-            content = redirect_file.read_text(encoding=self.encoding).strip()
-            if not content:
-                return None
-            
-            # Resolve relative to the parent of the redirect file
-            # e.g., .claude/skills (file) -> .claude/ + ../.codex/skills
-            target = redirect_file.parent / content
-            target = target.resolve()
-            
-            if target.exists() and target.is_dir():
-                return target
-        except Exception as e:
-            print(f"[SkillLoader] Failed to resolve redirect file {redirect_file}: {e}")
-        
-        return None
-    
+        discovered: List[DiscoveredItem] = []
+        seen_paths = set()
+        for item in discover_dirs_with_file(self._search_paths, self.SKILL_FILE):
+            if item not in seen_paths:
+                discovered.append(DiscoveredItem(name=item.name, path=item))
+                seen_paths.add(item)
+        return discovered
+
     def discover_skills(self) -> List[Path]:
         """
         Discover all skills in search paths.
-        
+
         Returns:
             List of discovered skill directory paths
         """
-        discovered_paths = []
-        
-        for search_path in self._search_paths:
-            if not search_path.exists():
-                continue
-            
-            for item in search_path.iterdir():
-                if item.is_dir():
-                    skill_file = item / self.SKILL_FILE
-                    if skill_file.exists():
-                        # Use path as identifier during discovery
-                        # Actual name will be determined from frontmatter during load
-                        if item not in discovered_paths:
-                            discovered_paths.append(item)
-        
-        return discovered_paths
+        return [item.path for item in self._discover_items() if item.path]
     
     def load_skill(self, name: str, path: Optional[Path] = None) -> Optional[Skill]:
         """
@@ -256,8 +206,9 @@ class SkillLoader:
         
         try:
             # Read skill content
-            with open(skill_file, "r", encoding=self.encoding) as f:
-                raw_content = f.read()
+            raw_content = read_text_file(skill_file, self.encoding)
+            if raw_content is None:
+                return None
             
             # Parse YAML frontmatter if present
             frontmatter, content = self._parse_frontmatter(raw_content)
@@ -301,18 +252,12 @@ class SkillLoader:
         Returns:
             Tuple of (frontmatter_dict, content_without_frontmatter)
         """
-        match = self.YAML_FRONTMATTER_PATTERN.match(content)
-        if match:
-            try:
-                yaml_content = match.group(1)
-                frontmatter = yaml.safe_load(yaml_content) or {}
-                remaining_content = match.group(2)
-                return frontmatter, remaining_content
-            except yaml.YAMLError:
-                # Invalid YAML - treat as no frontmatter
-                pass
-        
-        # No frontmatter found
+        frontmatter, remaining_content, has_frontmatter = parse_yaml_frontmatter(
+            content,
+            strip_on_error=False,
+        )
+        if has_frontmatter:
+            return frontmatter, remaining_content
         return {}, content
     
     def _extract_description(self, content: str) -> str:
@@ -366,6 +311,22 @@ class SkillLoader:
         
         return resources
     
+    def _load_item(self, name: str, path: Optional[Path]) -> Optional[Skill]:
+        return self.load_skill(name, path)
+
+    def _is_loaded(self, item: DiscoveredItem) -> bool:
+        if not item.path:
+            return super()._is_loaded(item)
+        return any(str(s.path) == str(item.path) for s in self._skills.values())
+
+    def _get_reload_path(self, name: str) -> Optional[Path]:
+        skill = self._skills.get(name)
+        return skill.path if skill else None
+
+    def _on_unload(self, name: str) -> None:
+        if name in self._skill_sources:
+            del self._skill_sources[name]
+
     def load_all_skills(self) -> Dict[str, Skill]:
         """
         Load all discovered skills.
@@ -373,17 +334,7 @@ class SkillLoader:
         Returns:
             Dictionary of loaded skills
         """
-        discovered_paths = self.discover_skills()
-        for skill_path in discovered_paths:
-            # Check if already loaded by path
-            already_loaded = any(
-                str(s.path) == str(skill_path) for s in self._skills.values()
-            )
-            if not already_loaded:
-                # Load with directory name as default, actual name from frontmatter
-                self.load_skill(skill_path.name, skill_path)
-        
-        return self._skills
+        return self.load_all()
     
     def get_skill(self, name: str) -> Optional[Skill]:
         """
@@ -410,7 +361,7 @@ class SkillLoader:
     
     def get_all_skills(self) -> Dict[str, Skill]:
         """Get all loaded skills."""
-        return self._skills
+        return self.get_all_items()
     
     def get_enabled_skills(self) -> List[Skill]:
         """Get all enabled skills."""
@@ -434,21 +385,11 @@ class SkillLoader:
     
     def reload_skill(self, name: str) -> Optional[Skill]:
         """Reload a skill from disk."""
-        if name in self._skills:
-            path = self._skills[name].path
-            del self._skills[name]
-            return self.load_skill(name, path)
-        return None
+        return self.reload_item(name)
     
     def unload_skill(self, name: str) -> bool:
         """Unload a skill."""
-        if name in self._skills:
-            del self._skills[name]
-            # Also remove from sources
-            if name in self._skill_sources:
-                del self._skill_sources[name]
-            return True
-        return False
+        return self.unload_item(name)
     
     def initialize_default_paths(self, project_path: str) -> None:
         """

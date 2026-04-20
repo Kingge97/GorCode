@@ -509,3 +509,130 @@ class CompactionManager:
         """
         usage = self.get_token_usage(messages)
         return usage["should_soft_compact"] or usage["should_hard_compact"]
+
+
+def build_compaction_config(
+    config_manager: Any = None,
+    context_limit: Optional[int] = None,
+    auto_compact: bool = True,
+) -> CompactionConfig:
+    """
+    Build a compaction config using config_manager when available.
+
+    Args:
+        config_manager: Optional config manager with .config.max_context_length
+        context_limit: Optional explicit context limit override
+        auto_compact: Whether to enable auto compaction
+
+    Returns:
+        CompactionConfig instance
+    """
+    if context_limit is None:
+        context_limit = 128000
+        if config_manager and hasattr(config_manager, "config"):
+            context_limit = getattr(
+                config_manager.config,
+                "max_context_length",
+                context_limit,
+            )
+
+    return CompactionConfig(
+        context_limit=context_limit,
+        auto_compact=auto_compact,
+    )
+
+
+def create_compaction_manager(
+    event_bus: EventBus = None,
+    config_manager: Any = None,
+    model_manager=None,
+    model_connector=None,
+    context_limit: Optional[int] = None,
+    auto_compact: bool = True,
+) -> CompactionManager:
+    """
+    Create a compaction manager with shared initialization logic.
+
+    Args:
+        event_bus: Event bus for notifications
+        config_manager: Optional config manager with max_context_length
+        model_manager: Optional model manager (preferred for dynamic connector)
+        model_connector: Optional direct model connector
+        context_limit: Optional explicit context limit override
+        auto_compact: Whether to enable auto compaction
+
+    Returns:
+        CompactionManager instance
+    """
+    compaction_config = build_compaction_config(
+        config_manager=config_manager,
+        context_limit=context_limit,
+        auto_compact=auto_compact,
+    )
+    return CompactionManager(
+        event_bus=event_bus,
+        config=compaction_config,
+        model_manager=model_manager,
+        model_connector=model_connector,
+    )
+
+
+def build_compaction_status_message(
+    result: CompactionResult,
+    prefix: str = "",
+    include_emoji: bool = False,
+    lowercase_type: bool = False,
+) -> str:
+    """
+    Build a standardized compaction status message.
+
+    Args:
+        result: Compaction result
+        prefix: Optional label prefix (e.g., "Subagent")
+        include_emoji: Whether to include status emoji
+        lowercase_type: Whether to lowercase the compaction type label
+
+    Returns:
+        Status message string
+    """
+    if result.is_hard_compaction:
+        type_label = "hard compaction" if lowercase_type else "Hard compaction"
+    elif result.is_soft_compaction:
+        type_label = "soft compaction" if lowercase_type else "Soft compaction"
+    else:
+        type_label = "context compacted" if lowercase_type else "Context compacted"
+
+    if prefix:
+        type_label = f"{prefix} {type_label}"
+
+    emoji = "🗜️ " if include_emoji else ""
+    if result.is_hard_compaction or result.is_soft_compaction:
+        return (
+            f"{emoji}{type_label}: "
+            f"{result.original_tokens} -> {result.compacted_tokens} tokens "
+            f"({result.compression_ratio:.1f}x)"
+        )
+    return (
+        f"{emoji}{type_label}: "
+        f"{result.original_tokens} -> {result.compacted_tokens} tokens"
+    )
+
+
+def build_compaction_summary_message(
+    result: CompactionResult,
+    prefix: str = "",
+) -> Optional[str]:
+    """
+    Build a standardized compaction summary message.
+
+    Args:
+        result: Compaction result
+        prefix: Optional label prefix (e.g., "Subagent")
+
+    Returns:
+        Summary message string or None if no summary
+    """
+    if not result.summary:
+        return None
+    label = f"{prefix} Compaction Summary".strip()
+    return f"[{label}] {result.summary}"

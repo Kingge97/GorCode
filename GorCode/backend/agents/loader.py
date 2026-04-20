@@ -5,8 +5,6 @@ Agent Loader Module
 Loader for agents from Markdown files with YAML frontmatter.
 """
 
-import re
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -16,9 +14,10 @@ try:
 except ImportError:
     from importlib_resources import files, as_file
 
-import yaml
-
 from .base import AgentInfo, AgentMode, AgentPermission, PermissionLevel
+from ..utils.frontmatter import parse_yaml_frontmatter
+from ..utils.loader_helpers import discover_files, read_text_file
+from ..utils.loader_base import DiscoveredItem, LoaderBase
 
 
 # Default values for Agent fields
@@ -37,7 +36,7 @@ DEFAULT_AGENT_VALUES = {
 }
 
 
-class AgentLoader:
+class AgentLoader(LoaderBase[AgentInfo]):
     """
     Loader for agents from Markdown files with YAML frontmatter.
     
@@ -61,7 +60,7 @@ class AgentLoader:
     """
     
     AGENT_FILE_PATTERN = "*.md"
-    YAML_FRONTMATTER_PATTERN = re.compile(r'^---\s*\n(.*?)\n---\s*\n(.*)$', re.DOTALL)
+    # YAML frontmatter parsing is handled by utils.frontmatter
     
     def __init__(self, encoding: str = "utf-8"):
         """
@@ -70,9 +69,8 @@ class AgentLoader:
         Args:
             encoding: Default encoding for reading files
         """
-        self.encoding = encoding
-        self._agents: Dict[str, AgentInfo] = {}
-        self._search_paths: List[Path] = []
+        super().__init__(encoding=encoding)
+        self._agents: Dict[str, AgentInfo] = self._items
         self._builtin_path: Optional[Path] = None
         self._builtin_loaded_from_resource = False
     
@@ -83,9 +81,7 @@ class AgentLoader:
         Args:
             path: Directory path to search
         """
-        path = Path(path)
-        if path.exists() and path not in self._search_paths:
-            self._search_paths.append(path)
+        self._add_search_path(path, allow_redirect=False, allow_symlink=False)
     
     def _get_builtin_agents_path(self) -> Optional[Path]:
         """
@@ -153,27 +149,19 @@ class AgentLoader:
             pass
         return agent_names
     
-    def discover_agents(self) -> List[str]:
+    def _discover_items(self) -> List[DiscoveredItem]:
         """
         Discover all agents in search paths and built-in location.
-        
-        Returns:
-            List of discovered agent names
         """
-        discovered = []
+        discovered: List[DiscoveredItem] = []
         seen_names = set()
         
         # Search in user-defined paths first
-        for search_path in self._search_paths:
-            if not search_path.exists():
-                continue
-            
-            for item in search_path.glob(self.AGENT_FILE_PATTERN):
-                if item.is_file():
-                    agent_name = item.stem
-                    if agent_name not in seen_names:
-                        discovered.append(agent_name)
-                        seen_names.add(agent_name)
+        for item in discover_files(self._search_paths, self.AGENT_FILE_PATTERN):
+            agent_name = item.stem
+            if agent_name not in seen_names:
+                discovered.append(DiscoveredItem(name=agent_name))
+                seen_names.add(agent_name)
         
         # Add built-in agents
         builtin_path = self._get_builtin_agents_path()
@@ -182,16 +170,25 @@ class AgentLoader:
                 if item.is_file():
                     agent_name = item.stem
                     if agent_name not in seen_names:
-                        discovered.append(agent_name)
+                        discovered.append(DiscoveredItem(name=agent_name))
                         seen_names.add(agent_name)
         else:
             # Packaged mode - get from resources
             for agent_name in self._list_builtin_agents_from_resource():
                 if agent_name not in seen_names:
-                    discovered.append(agent_name)
+                    discovered.append(DiscoveredItem(name=agent_name))
                     seen_names.add(agent_name)
         
         return discovered
+
+    def discover_agents(self) -> List[str]:
+        """
+        Discover all agents in search paths and built-in location.
+
+        Returns:
+            List of discovered agent names
+        """
+        return [item.name for item in self._discover_items()]
     
     def load_agent(self, name: str, path: Optional[Path] = None) -> Optional[AgentInfo]:
         """
@@ -253,11 +250,7 @@ class AgentLoader:
     
     def _read_file_content(self, path: Path) -> Optional[str]:
         """Read file content with error handling."""
-        try:
-            with open(path, "r", encoding=self.encoding) as f:
-                return f.read()
-        except Exception:
-            return None
+        return read_text_file(path, self.encoding)
     
     def _parse_agent_file(self, content: str, filename: str) -> Optional[AgentInfo]:
         """
@@ -270,20 +263,13 @@ class AgentLoader:
         Returns:
             Parsed AgentInfo or None if parsing failed
         """
-        # Try to extract YAML frontmatter
-        match = self.YAML_FRONTMATTER_PATTERN.match(content)
-        
-        if match:
-            yaml_content = match.group(1)
-            prompt_content = match.group(2).strip()
-            
-            try:
-                frontmatter = yaml.safe_load(yaml_content) or {}
-            except yaml.YAMLError:
-                frontmatter = {}
+        frontmatter, remainder, has_frontmatter = parse_yaml_frontmatter(
+            content,
+            strip_on_error=True,
+        )
+        if has_frontmatter:
+            prompt_content = remainder.strip()
         else:
-            # No frontmatter - use entire content as prompt
-            frontmatter = {}
             prompt_content = content.strip()
         
         # Extract and apply defaults
@@ -497,6 +483,9 @@ class AgentLoader:
         
         return PermissionLevel.ALLOW
     
+    def _load_item(self, name: str, path: Optional[Path]) -> Optional[AgentInfo]:
+        return self.load_agent(name)
+
     def load_all_agents(self) -> Dict[str, AgentInfo]:
         """
         Load all discovered agents.
@@ -504,30 +493,20 @@ class AgentLoader:
         Returns:
             Dictionary of loaded agents
         """
-        discovered = self.discover_agents()
-        for name in discovered:
-            if name not in self._agents:
-                self.load_agent(name)
-        
-        return self._agents
+        return self.load_all()
     
     def get_agent(self, name: str) -> Optional[AgentInfo]:
         """Get a loaded agent by name."""
-        return self._agents.get(name)
+        return self.get_item(name)
     
     def get_all_agents(self) -> Dict[str, AgentInfo]:
         """Get all loaded agents."""
-        return self._agents
+        return self.get_all_items()
     
     def reload_agent(self, name: str) -> Optional[AgentInfo]:
         """Reload an agent from disk."""
-        if name in self._agents:
-            del self._agents[name]
-        return self.load_agent(name)
+        return self.reload_item(name)
     
     def unload_agent(self, name: str) -> bool:
         """Unload an agent."""
-        if name in self._agents:
-            del self._agents[name]
-            return True
-        return False
+        return self.unload_item(name)

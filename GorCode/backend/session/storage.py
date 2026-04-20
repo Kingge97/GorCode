@@ -319,6 +319,15 @@ class SessionStorage:
             Number of sessions
         """
         return len(self._load_index())
+
+    def list_session_ids(self) -> List[str]:
+        """
+        List all session IDs from the index.
+        
+        Returns:
+            List of session IDs
+        """
+        return list(self._load_index().keys())
     
     # ========================
     # Maintenance

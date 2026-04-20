@@ -7,13 +7,20 @@ Tool for spawning and managing subagents.
 
 import time
 import json
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from dataclasses import dataclass
 
-from .base import BaseTool, ToolResult, ToolDefinition
+from .core_tool_support.base import BaseTool, ToolResult
+from .core_tool_support.tool_utils import build_parameters_schema, tool_error_result
 from ..core.events import EventBus, Event, EventType
-from ..context import CompactionManager, CompactionConfig, TokenEstimator
-from ..permission import get_permission_manager, PermissionType, PermissionResponse
+from ..context import (
+    CompactionManager,
+    create_compaction_manager,
+    build_compaction_status_message,
+    build_compaction_summary_message,
+)
+from ..permission import get_permission_manager
+from .task_tool_support.permission_exec import execute_with_permissions
 
 
 @dataclass
@@ -99,7 +106,6 @@ class TaskTool(BaseTool):
         self._model_connectors: Dict[str, Any] = {}  # Cache for model connectors by agent type
         self._permission_manager = permission_manager or get_permission_manager()
         self._permission_callback = permission_callback
-        self._current_skill_context: Optional[Dict[str, Any]] = None
         self._subagent_seq = 0  # Incremental id for subagent runs
         
         # Initialize compaction manager for subagent context management
@@ -118,22 +124,11 @@ class TaskTool(BaseTool):
         Returns:
             CompactionManager instance
         """
-        # Get context limit from config_manager if available
-        context_limit = 128000  # Default
-        if self._config_manager and hasattr(self._config_manager, 'config'):
-            context_limit = getattr(self._config_manager.config, 'max_context_length', 128000)
-        
-        compaction_config = CompactionConfig(
-            context_limit=context_limit,
-            auto_compact=True,
-        )
-        
         # Use provided connector or fall back to default
         connector = model_connector or self._model_connector
-        
-        return CompactionManager(
+        return create_compaction_manager(
             event_bus=self._event_bus,
-            config=compaction_config,
+            config_manager=self._config_manager,
             model_connector=connector,
         )
     
@@ -219,6 +214,30 @@ class TaskTool(BaseTool):
         """Emit an event through the event bus."""
         if self._event_bus:
             self._event_bus.emit(event_type, data, source="subagent")
+
+    def _emit_subagent_end(
+        self,
+        *,
+        agent_type: str,
+        success: bool,
+        output: str,
+        parent_name: Optional[str],
+        subagent_run_id: str,
+        display_name: str,
+        truncate_output: bool = False,
+        max_output_len: int = 300,
+    ) -> None:
+        """Emit a subagent end event with a consistent payload."""
+        if truncate_output and output:
+            output = output[:max_output_len]
+        self._emit_event(EventType.AGENT_SUBAGENT_END, {
+            "agent_name": agent_type,
+            "success": success,
+            "output": output,
+            "parent_agent": parent_name,
+            "agent_run_id": subagent_run_id,
+            "agent_display_name": display_name,
+        })
     
     def execute(
         self,
@@ -321,14 +340,14 @@ class TaskTool(BaseTool):
                 
                 if response.is_error:
                     # 发出子代理结束事件
-                    self._emit_event(EventType.AGENT_SUBAGENT_END, {
-                        "agent_name": agent_type,
-                        "success": False,
-                        "output": response.error_message,
-                        "parent_agent": parent_name,
-                        "agent_run_id": subagent_run_id,
-                        "agent_display_name": display_name,
-                    })
+                    self._emit_subagent_end(
+                        agent_type=agent_type,
+                        success=False,
+                        output=response.error_message,
+                        parent_name=parent_name,
+                        subagent_run_id=subagent_run_id,
+                        display_name=display_name,
+                    )
                     return ToolResult(
                         success=False,
                         output="",
@@ -398,33 +417,37 @@ class TaskTool(BaseTool):
                     if result.success and result.compaction_type != "none":
                         messages = result.messages
                         
-                        # Build compaction status message
-                        if result.is_hard_compaction:
-                            status_msg = f"🗜️ Subagent hard compaction: {result.original_tokens} -> {result.compacted_tokens} tokens ({result.compression_ratio:.1f}x)"
-                        elif result.is_soft_compaction:
-                            status_msg = f"🗜️ Subagent soft compaction: {result.original_tokens} -> {result.compacted_tokens} tokens ({result.compression_ratio:.1f}x)"
-                        else:
-                            status_msg = f"🗜️ Subagent context compacted: {result.original_tokens} -> {result.compacted_tokens} tokens"
+                        status_msg = build_compaction_status_message(
+                            result,
+                            prefix="Subagent",
+                            include_emoji=True,
+                            lowercase_type=True,
+                        )
                         
                         # Emit compaction event for UI notification
                         self._emit_event(EventType.UI_MESSAGE, {"message": status_msg})
                         
                         # Emit compaction summary if available (full text, no truncation)
-                        if result.summary:
-                            summary_msg = f"[Subagent Compaction Summary] {result.summary}"
+                        summary_msg = build_compaction_summary_message(
+                            result,
+                            prefix="Subagent",
+                        )
+                        if summary_msg:
                             self._emit_event(EventType.UI_MESSAGE, {"message": summary_msg})
             
             duration = time.time() - start_time
             
             # 发出子代理结束事件
-            self._emit_event(EventType.AGENT_SUBAGENT_END, {
-                "agent_name": agent_type,
-                "success": True,
-                "output": final_output[:300] if final_output else "",
-                "parent_agent": parent_name,
-                "agent_run_id": subagent_run_id,
-                "agent_display_name": display_name,
-            })
+            self._emit_subagent_end(
+                agent_type=agent_type,
+                success=True,
+                output=final_output or "",
+                parent_name=parent_name,
+                subagent_run_id=subagent_run_id,
+                display_name=display_name,
+                truncate_output=True,
+                max_output_len=300,
+            )
             
             return ToolResult(
                 success=True,
@@ -440,58 +463,18 @@ class TaskTool(BaseTool):
             
         except Exception as e:
             # 发出子代理结束事件
-            self._emit_event(EventType.AGENT_SUBAGENT_END, {
-                "agent_name": agent_type,
-                "success": False,
-                "output": str(e),
-                "parent_agent": parent_name,
-                "agent_run_id": subagent_run_id,
-                "agent_display_name": display_name,
-            })
-            return ToolResult(
+            self._emit_subagent_end(
+                agent_type=agent_type,
                 success=False,
-                output="",
-                error=f"Subagent execution error: {str(e)}"
+                output=str(e),
+                parent_name=parent_name,
+                subagent_run_id=subagent_run_id,
+                display_name=display_name,
             )
+            return tool_error_result(e, prefix="Subagent execution error: ")
         finally:
             self._parent_agent_name = previous_parent_name
 
-    def _request_permission(
-        self,
-        permission_type: PermissionType,
-        metadata: Dict[str, Any],
-    ) -> Tuple[bool, Optional[str]]:
-        """Request permission and return (granted, error_message)."""
-        if not self._permission_manager:
-            return True, None
-        
-        if self._permission_manager.has_session_permission(permission_type):
-            return True, None
-        
-        if not self._permission_callback:
-            return False, "Permission denied (no callback set)"
-        
-        callback_result = self._permission_callback(permission_type.value, metadata)
-        if isinstance(callback_result, tuple):
-            response, reason = callback_result
-        else:
-            response, reason = callback_result, None
-        
-        if isinstance(response, PermissionResponse):
-            response = response.value
-        
-        response_str = str(response).lower() if response is not None else ""
-        
-        if response_str == "always":
-            self._permission_manager.grant_session_permission(permission_type)
-            return True, None
-        if response_str == "once":
-            return True, None
-        
-        if reason and str(reason).strip():
-            return False, f"操作被用户拒绝 - {reason}"
-        return False, "用户拒绝操作且未提供理由"
-    
     def _execute_tool_with_permissions(
         self,
         tool_name: str,
@@ -513,69 +496,14 @@ class TaskTool(BaseTool):
                 error=f"Tool '{tool_name}' not found"
             )
         
-        # Track skill context for bash commands
-        if tool_name == "Skill":
-            result = self._tool_registry.execute(tool_name, **tool_args)
-            if result.metadata and result.metadata.get("skill_dir"):
-                self._current_skill_context = {
-                    "skill_name": result.metadata.get("skill_name"),
-                    "skill_dir": result.metadata.get("skill_dir"),
-                }
-            return result
-        
-        # Special handling for bash with skill context
-        if tool_name == "bash" and self._current_skill_context and hasattr(tool, "execute_with_skill_context"):
-            result = tool.execute_with_skill_context(
-                command=tool_args.get("command", ""),
-                timeout=tool_args.get("timeout", 60),
-                cwd=tool_args.get("cwd"),
-                skill_dir=self._current_skill_context.get("skill_dir"),
-            )
-        else:
-            result = self._tool_registry.execute(tool_name, **tool_args)
-        
-        # If tool doesn't require permission, return directly
-        if not getattr(tool, "requires_permission", False):
-            return result
-        
-        # If preview failed or no permission required, return as-is
-        if not result.metadata or not result.metadata.get("requires_permission"):
-            return result
-        
-        # Determine permission type
-        permission_type = None
-        if tool_name == "write":
-            permission_type = PermissionType.WRITE
-        elif tool_name == "edit":
-            permission_type = PermissionType.EDIT
-        elif tool_name == "bash":
-            permission_type = PermissionType.BASH_DELETE if result.metadata.get("has_delete") else PermissionType.BASH
-        
-        if permission_type:
-            granted, error_msg = self._request_permission(permission_type, result.metadata)
-            if not granted:
-                return ToolResult(success=False, output="", error=error_msg)
-        
-        # Permission granted - execute actual operation
-        if tool_name == "write" and hasattr(tool, "execute_with_permission"):
-            return tool.execute_with_permission(
-                file_path=result.metadata.get("file_path"),
-                content=result.metadata.get("content"),
-                encoding=result.metadata.get("encoding", "utf-8"),
-            )
-        if tool_name == "edit" and hasattr(tool, "execute_with_permission"):
-            return tool.execute_with_permission(
-                file_path=result.metadata.get("file_path"),
-                new_content=result.metadata.get("new_content"),
-                encoding=result.metadata.get("encoding", "utf-8"),
-            )
-        if tool_name == "bash" and hasattr(tool, "execute_with_permission"):
-            return tool.execute_with_permission(
-                command=result.metadata.get("command"),
-                timeout=result.metadata.get("timeout", 60),
-                cwd=result.metadata.get("cwd"),
-            )
-        
+        result = self._tool_registry.execute(tool_name, **tool_args)
+        result, _ = execute_with_permissions(
+            tool_name,
+            tool,
+            result,
+            self._permission_manager,
+            self._permission_callback,
+        )
         return result
     
     def _build_system_prompt(self, agent_type: str, agent_config) -> str:
@@ -694,42 +622,40 @@ class TaskTool(BaseTool):
         
         return True
     
-    def get_definition(self) -> ToolDefinition:
-        """Get tool definition with dynamic agent types."""
-        # Get available agent types dynamically
+    def get_description(self) -> str:
+        """Get tool description with dynamic agent types."""
         available_types = self._get_available_agent_types()
         agent_desc = "\n".join([f"- {k}: {v}" for k, v in available_types.items()])
-        agent_enum = list(available_types.keys())
-        
-        return ToolDefinition(
-            name=self.name,
-            description=f"""Spawn a subagent for a focused subtask.
+        return f"""Spawn a subagent for a focused subtask.
 
 Agent types:
-{agent_desc}""",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "description": {
-                        "type": "string",
-                        "description": "Short task description (3-5 words)"
-                    },
-                    "prompt": {
-                        "type": "string",
-                        "description": "Detailed instructions for the subagent"
-                    },
-                    "agent_type": {
-                        "type": "string",
-                        "enum": agent_enum,
-                        "description": "Type of agent to spawn"
-                    },
-                    "max_steps": {
-                        "type": "integer",
-                        "description": "Optional maximum number of tool calls (<= 0 for unlimited)",
-                        "default": 0
-                    }
+{agent_desc}"""
+
+    def get_parameters(self) -> Dict[str, Any]:
+        """Get tool parameter schema with dynamic agent types."""
+        available_types = self._get_available_agent_types()
+        agent_enum = list(available_types.keys())
+        
+        return build_parameters_schema(
+            properties={
+                "description": {
+                    "type": "string",
+                    "description": "Short task description (3-5 words)"
                 },
-                "required": ["description", "prompt", "agent_type"]
+                "prompt": {
+                    "type": "string",
+                    "description": "Detailed instructions for the subagent"
+                },
+                "agent_type": {
+                    "type": "string",
+                    "enum": agent_enum,
+                    "description": "Type of agent to spawn"
+                },
+                "max_steps": {
+                    "type": "integer",
+                    "description": "Optional maximum number of tool calls (<= 0 for unlimited)",
+                    "default": 0
+                }
             },
-            category=self.category,
+            required=["description", "prompt", "agent_type"],
         )

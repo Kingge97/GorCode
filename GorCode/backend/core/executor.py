@@ -11,22 +11,28 @@ import json
 import sys
 import os
 import time
+from pathlib import Path
 
 from .events import EventBus, Event, EventType
 from .model_connector import ModelConnector, ModelManager
 from ..config.manager import ConfigManager, ModelConnection
-from ..tools.base import ToolRegistry, ToolResult
+from ..tools.core_tool_support.base import ToolRegistry, ToolResult
 from ..agents.base import AgentRegistry, AgentInfo
 from ..session import SessionManager, SessionStorage, DebugLogger
 from ..permission import get_permission_manager, PermissionType, PermissionResponse
+from ..tools.task_tool_support.permission_exec import execute_with_permissions, get_permission_request
 from ..context import (
     TokenEstimator,
     CompactionManager,
-    CompactionConfig,
     ResponseCache,
     StreamingOptimizer,
+    create_compaction_manager,
+    build_compaction_status_message,
+    build_compaction_summary_message,
 )
 from ..skills import SkillLoader, SkillInjector
+from ..context.environment import EnvironmentBlockInputs, build_environment_block
+from ..platform.detector import PlatformDetector
 
 # Import ToolExecutor from GorAI_LLMClient
 try:
@@ -78,7 +84,6 @@ class GorCodeToolExecutor(ToolExecutor):
         self._permission_callback = permission_callback
         self._backend_state = backend_state
         self._user_rejected_without_reason = False  # Flag for rejection without reason
-        self._current_skill_context: Optional[Dict[str, Any]] = None  # Track skill context for path resolution
     
     def execute_tool(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         """
@@ -93,83 +98,31 @@ class GorCodeToolExecutor(ToolExecutor):
         """
         if self.tool_registry is None:
             return f"Error: Tool registry not available"
-        
-        # Handle Skill tool - capture skill context for subsequent bash commands
+
+        result = self.tool_registry.execute(tool_name, **arguments)
+
         if tool_name == "Skill":
-            result = self.tool_registry.execute(tool_name, **arguments)
-            # Capture skill context from metadata
-            if result.metadata and result.metadata.get("skill_dir"):
-                self._current_skill_context = {
-                    "skill_name": result.metadata.get("skill_name"),
-                    "skill_dir": result.metadata.get("skill_dir"),
-                }
             if result.success:
                 return result.output
-            else:
-                return f"Error: {result.error}" if result.error else "Error: Skill loading failed"
-        
-        # Handle Bash tool with skill context
-        if tool_name == "bash" and self._current_skill_context:
-            tool = self.tool_registry.get(tool_name)
-            if tool:
-                # Execute with skill context for path resolution
-                command = arguments.get("command", "")
-                timeout = arguments.get("timeout", 60)
-                cwd = arguments.get("cwd")
-                skill_dir = self._current_skill_context.get("skill_dir")
-                
-                # Use execute_with_skill_context if available
-                if hasattr(tool, 'execute_with_skill_context'):
-                    result = tool.execute_with_skill_context(
-                        command=command,
-                        timeout=timeout,
-                        cwd=cwd,
-                        skill_dir=skill_dir
-                    )
-                else:
-                    result = self.tool_registry.execute(tool_name, **arguments)
-                
-                # Handle permission for bash
-                if result.metadata and result.metadata.get("requires_permission"):
-                    return self._handle_bash_permission(tool, result, arguments)
-                
-                if result.success:
-                    return result.output if result.output else "Command executed successfully"
-                else:
-                    # Return error with output if available (e.g., timeout with partial logs)
-                    if result.error:
-                        return f"Error: {result.error}"
-                    elif result.output:
-                        return result.output
-                    else:
-                        return "Error: Command execution failed"
-        
-        # Check if tool requires permission
+            return f"Error: {result.error}" if result.error else "Error: Skill loading failed"
+
         tool = self.tool_registry.get(tool_name)
-        if tool and getattr(tool, 'requires_permission', False):
-            # Execute in preview mode first to get metadata
-            result = self.tool_registry.execute(tool_name, **arguments)
-            
-            if result.metadata and result.metadata.get("requires_permission"):
-                return self._handle_tool_permission(tool_name, tool, result, arguments)
-            
-            # Return result
-            if result.success:
-                return result.output if result.output else "Command executed successfully"
-            else:
-                # Return error with output if available
-                if result.error:
-                    return f"Error: {result.error}"
-                elif result.output:
-                    return result.output
-                else:
-                    return "Error: Tool execution failed"
-        else:
-            # Tool doesn't require permission - execute directly
-            result = self.tool_registry.execute(tool_name, **arguments)
-        
+        result, rejected_without_reason = execute_with_permissions(
+            tool_name,
+            tool,
+            result,
+            self._permission_manager,
+            self._permission_callback,
+        )
+        if rejected_without_reason:
+            self._user_rejected_without_reason = True
+            if self._backend_state:
+                self._backend_state.user_rejected_without_reason = True
+
         if result.success:
-            return result.output
+            if result.metadata and "result_object" in result.metadata:
+                return result.metadata.get("result_object")
+            return result.output if result.output else "Command executed successfully"
         else:
             # Return error with output if available
             if result.error:
@@ -178,134 +131,6 @@ class GorCodeToolExecutor(ToolExecutor):
                 return result.output
             else:
                 return "Error: Tool execution failed"
-    
-    def _handle_tool_permission(self, tool_name: str, tool, result: ToolResult, arguments: Dict[str, Any]) -> str:
-        """Handle permission check and execution for tools."""
-        # Import here to avoid circular dependency
-        from backend.permission import PermissionType
-        
-        # Determine permission type
-        permission_type = None
-        if tool_name == "write":
-            permission_type = PermissionType.WRITE
-        elif tool_name == "edit":
-            permission_type = PermissionType.EDIT
-        elif tool_name == "bash":
-            if result.metadata.get("has_delete"):
-                permission_type = PermissionType.BASH_DELETE
-            else:
-                permission_type = PermissionType.BASH
-        
-        if permission_type and self._permission_manager:
-            # Check if already has session permission
-            if not self._permission_manager.has_session_permission(permission_type):
-                # Request permission
-                if self._permission_callback:
-                    callback_result = self._permission_callback(permission_type.value, result.metadata)
-                    
-                    # Handle tuple result (response, reason)
-                    if isinstance(callback_result, tuple):
-                        response, reason = callback_result
-                    else:
-                        # Backward compatibility
-                        response = callback_result
-                        reason = None
-                    
-                    if response == "always":
-                        self._permission_manager.grant_session_permission(permission_type)
-                    elif response == "once":
-                        pass  # Allow this time
-                    else:  # reject
-                        # Check if reason is provided
-                        if reason and reason.strip():
-                            # 有理由：返回错误让AI知道
-                            return f"Error: 操作被用户拒绝 - {reason}"
-                        else:
-                            # 无理由：设置标志并返回错误
-                            self._user_rejected_without_reason = True
-                            if self._backend_state:
-                                self._backend_state.user_rejected_without_reason = True
-                            return "Error: 用户拒绝操作且未提供理由"
-                else:
-                    # No callback - reject by default
-                    return "Error: Permission denied (no callback set)"
-            
-            # Permission granted - execute with permission
-            if tool_name in ("write", "edit"):
-                if hasattr(tool, 'execute_with_permission'):
-                    if tool_name == "write":
-                        result = tool.execute_with_permission(
-                            file_path=result.metadata.get("file_path"),
-                            content=result.metadata.get("content"),
-                            encoding=result.metadata.get("encoding", "utf-8")
-                        )
-                    elif tool_name == "edit":
-                        result = tool.execute_with_permission(
-                            file_path=result.metadata.get("file_path"),
-                            new_content=result.metadata.get("new_content"),
-                            encoding=result.metadata.get("encoding", "utf-8")
-                        )
-            elif tool_name == "bash":
-                return self._handle_bash_execution(tool, result)
-        
-        if result.success:
-            return result.output if result.output else "Command executed successfully"
-        else:
-            return f"Error: {result.error}" if result.error else "Error: Tool execution failed"
-    
-    def _handle_bash_permission(self, tool, result: ToolResult, arguments: Dict[str, Any]) -> str:
-        """Handle permission specifically for bash tool with skill context."""
-        # Import here to avoid circular dependency
-        from backend.permission import PermissionType
-        
-        permission_type = PermissionType.BASH_DELETE if result.metadata.get("has_delete") else PermissionType.BASH
-        
-        if self._permission_manager and not self._permission_manager.has_session_permission(permission_type):
-            if self._permission_callback:
-                callback_result = self._permission_callback(permission_type.value, result.metadata)
-                
-                if isinstance(callback_result, tuple):
-                    response, reason = callback_result
-                else:
-                    response = callback_result
-                    reason = None
-                
-                if response == "always":
-                    self._permission_manager.grant_session_permission(permission_type)
-                elif response == "once":
-                    pass
-                else:  # reject
-                    if reason and reason.strip():
-                        return f"Error: 操作被用户拒绝 - {reason}"
-                    else:
-                        self._user_rejected_without_reason = True
-                        if self._backend_state:
-                            self._backend_state.user_rejected_without_reason = True
-                        return "Error: 用户拒绝操作且未提供理由"
-            else:
-                return "Error: Permission denied (no callback set)"
-        
-        return self._handle_bash_execution(tool, result)
-    
-    def _handle_bash_execution(self, tool, result: ToolResult) -> str:
-        """Execute bash command with permission."""
-        if hasattr(tool, 'execute_with_permission'):
-            result = tool.execute_with_permission(
-                command=result.metadata.get("command"),
-                timeout=result.metadata.get("timeout", 60),
-                cwd=result.metadata.get("cwd")
-            )
-        
-        if result.success:
-            return result.output if result.output else "Command executed successfully"
-        else:
-            # Return error with output if available (e.g., timeout with partial logs)
-            if result.error:
-                return f"Error: {result.error}"
-            elif result.output:
-                return result.output
-            else:
-                return "Error: Command execution failed"
 
 
 @dataclass
@@ -340,7 +165,7 @@ class BackendExecutor:
     - Response caching
     """
     
-    def __init__(self, event_bus: EventBus = None):
+    def __init__(self, event_bus: EventBus = None, platform_detector: PlatformDetector = None):
         self.event_bus = event_bus or EventBus()
         self.state = BackendState()
         self._model_manager: ModelManager = None
@@ -354,6 +179,7 @@ class BackendExecutor:
         self._streaming_optimizer: StreamingOptimizer = None
         self._skill_loader: SkillLoader = None
         self._skill_injector: SkillInjector = None
+        self._platform_detector = platform_detector or PlatformDetector()
         
         # Permission management
         self._permission_manager = get_permission_manager()
@@ -384,6 +210,7 @@ class BackendExecutor:
         
         # Initialize model manager if config is available
         if config_manager:
+            self._permission_manager.apply_settings(config_manager.config)
             self._init_model_manager()
             self._init_session_manager()
             self._init_debug_logger()
@@ -452,12 +279,31 @@ class BackendExecutor:
         if self._reconnect_failure_count != 0:
             self._reconnect_failure_count = 0
 
-    def _sync_messages_from_system(self, messages_with_system: List[Dict]) -> None:
+    def _sync_messages_from_system(
+        self,
+        messages_with_system: List[Dict],
+        sync_session: bool = True,
+    ) -> None:
         """Sync messages (excluding system prompt) back to state and session."""
         if len(messages_with_system) > 1:
             self.state.messages = messages_with_system[1:].copy()
-            if self._session_manager:
+            if sync_session and self._session_manager:
                 self._session_manager.set_messages(self.state.messages)
+
+    def _debug_enabled(self) -> bool:
+        return bool(self._debug_logger and self._debug_logger.enabled)
+
+    def _log_debug_message(self, role: str, content: str) -> None:
+        if self._debug_enabled():
+            self._debug_logger.log_message(role, content)
+
+    def _log_debug_model_call(self, **kwargs: Any) -> None:
+        if self._debug_enabled():
+            self._debug_logger.log_model_call(**kwargs)
+
+    def _log_debug_tool_call(self, **kwargs: Any) -> None:
+        if self._debug_enabled():
+            self._debug_logger.log_tool_call(**kwargs)
 
     def _extract_connection_error_message(self, event: Dict[str, Any]) -> Optional[str]:
         """Extract connection error message if this event represents a connection issue."""
@@ -536,8 +382,9 @@ class BackendExecutor:
     
     async def _check_permission(
         self,
+        tool_name: str,
         permission_type: PermissionType,
-        metadata: Dict[str, Any]
+        metadata: Dict[str, Any],
     ) -> PermissionResponse:
         """
         Check if permission is granted for an operation.
@@ -549,16 +396,23 @@ class BackendExecutor:
         Returns:
             PermissionResponse from user
         """
+        decision = self._permission_manager.decide(tool_name, permission_type, metadata)
+        if decision.decision == "allow":
+            return PermissionResponse.ONCE
+        if decision.decision == "deny":
+            return PermissionResponse.REJECT
+
         # Emit permission request event
         self.emit(EventType.PERMISSION_REQUEST, {
             "permission_type": permission_type.value,
             "metadata": metadata,
         })
-        
+
         # Request permission from user
         response = await self._permission_manager.request_permission(
+            tool_name,
             permission_type,
-            metadata
+            metadata,
         )
         
         # Emit permission response event
@@ -572,13 +426,9 @@ class BackendExecutor:
     def _init_context_management(self) -> None:
         """Initialize context management (compaction, cache, streaming)."""
         # Initialize compaction manager
-        compaction_config = CompactionConfig(
-            context_limit=self._config_manager.config.max_context_length if self._config_manager else 128000,
-            auto_compact=True,
-        )
-        self._compaction_manager = CompactionManager(
+        self._compaction_manager = create_compaction_manager(
             event_bus=self.event_bus,
-            config=compaction_config,
+            config_manager=self._config_manager,
             model_manager=self._model_manager,
         )
         
@@ -679,6 +529,8 @@ class BackendExecutor:
             skill_tool = self._tool_registry.get("Skill")
             if skill_tool and hasattr(skill_tool, 'set_skill_loader'):
                 skill_tool.set_skill_loader(self._skill_loader)
+            if skill_tool and hasattr(skill_tool, 'set_base_dir') and self._config_manager:
+                skill_tool.set_base_dir(str(self._config_manager.project_path))
         
         # Log loaded skills
         skills = self._skill_loader.get_all_skills()
@@ -806,20 +658,17 @@ class BackendExecutor:
             if self._session_manager:
                 self._session_manager.set_messages(self.state.messages)
             
-            # Build status message based on compaction type
-            if result.is_hard_compaction:
-                status_msg = f"🗜️ Hard compaction: {result.original_tokens} -> {result.compacted_tokens} tokens ({result.compression_ratio:.1f}x)"
-            elif result.is_soft_compaction:
-                status_msg = f"🗜️ Soft compaction: {result.original_tokens} -> {result.compacted_tokens} tokens ({result.compression_ratio:.1f}x)"
-            else:
-                status_msg = f"🗜️ Context compacted: {result.original_tokens} -> {result.compacted_tokens} tokens"
+            status_msg = build_compaction_status_message(
+                result,
+                include_emoji=True,
+            )
             
             # Emit compaction event
             yield Event(EventType.UI_MESSAGE, {"message": status_msg})
             
             # Emit compaction summary if available (full text, no truncation)
-            if result.summary:
-                summary_msg = f"[Compaction Summary] {result.summary}"
+            summary_msg = build_compaction_summary_message(result)
+            if summary_msg:
                 yield Event(EventType.UI_MESSAGE, {"message": summary_msg})
             
             # Emit compaction details event
@@ -856,19 +705,13 @@ class BackendExecutor:
             if self._session_manager:
                 self._session_manager.set_messages(self.state.messages)
             
-            # Build status message based on compaction type
-            if result.is_hard_compaction:
-                status_msg = f"Hard compaction: {result.original_tokens} -> {result.compacted_tokens} tokens ({result.compression_ratio:.1f}x)"
-            elif result.is_soft_compaction:
-                status_msg = f"Soft compaction: {result.original_tokens} -> {result.compacted_tokens} tokens ({result.compression_ratio:.1f}x)"
-            else:
-                status_msg = f"Context compacted: {result.original_tokens} -> {result.compacted_tokens} tokens"
+            status_msg = build_compaction_status_message(result)
             
             self.emit(EventType.UI_MESSAGE, {"message": status_msg})
             
             # Emit compaction summary if available (full text, no truncation)
-            if result.summary:
-                summary_msg = f"[Compaction Summary] {result.summary}"
+            summary_msg = build_compaction_summary_message(result)
+            if summary_msg:
                 self.emit(EventType.UI_MESSAGE, {"message": summary_msg})
         
         return {
@@ -993,9 +836,34 @@ class BackendExecutor:
             custom_prompt = load_custom_prompt(self._get_workdir())
             if custom_prompt:
                 prompt = prompt + "\n\n# 项目自定义规则\n\n" + custom_prompt
-            
-            return prompt
-        return "You are a helpful AI assistant."
+
+            return self._append_environment_block(prompt)
+        return self._append_environment_block("You are a helpful AI assistant.")
+
+    def _append_environment_block(self, prompt: str) -> str:
+        if not prompt:
+            return build_environment_block(self._collect_environment_inputs())
+
+        block = build_environment_block(self._collect_environment_inputs())
+        return prompt + "\n\n" + block
+
+    def _collect_environment_inputs(self) -> EnvironmentBlockInputs:
+        workdir = self._get_workdir()
+        platform_info = self._platform_detector.detect()
+        return EnvironmentBlockInputs(
+            primary_workdir=workdir,
+            is_git_repo=self._is_git_repo(workdir),
+            additional_workdirs=self._get_additional_workdirs(),
+            platform=platform_info.os_name,
+            shell=platform_info.shell_type.value,
+            os_version=platform_info.os_version,
+        )
+
+    def _is_git_repo(self, workdir: str) -> bool:
+        return (Path(workdir) / ".git").exists()
+
+    def _get_additional_workdirs(self) -> List[str]:
+        return []
     
     def _get_workdir(self) -> str:
         """Get current working directory."""
@@ -1025,8 +893,7 @@ class BackendExecutor:
         # via set_messages() to avoid duplicate entries
         
         # Log to debug logger
-        if self._debug_logger and self._debug_logger.enabled:
-            self._debug_logger.log_message("user", user_input)
+        self._log_debug_message("user", user_input)
         
         # Emit input event
         yield Event(EventType.COMMAND_INPUT, {"input": user_input})
@@ -1085,11 +952,10 @@ class BackendExecutor:
                 tools = self._tool_registry.get_tool_definitions()
             
             # Log model call start
-            if self._debug_logger and self._debug_logger.enabled:
-                self._debug_logger.log_model_call(
-                    model=self.state.current_model,
-                    request={"messages": len(self.state.messages), "tools_count": len(tools)}
-                )
+            self._log_debug_model_call(
+                model=self.state.current_model,
+                request={"messages": len(self.state.messages), "tools_count": len(tools)}
+            )
             
             # Reset rejection flag at the start of each chat loop
             self.state.user_rejected_without_reason = False
@@ -1141,8 +1007,7 @@ class BackendExecutor:
                     # Check if context compaction is needed after each tool result
                     if event_type == "tool_result":
                         # Update state.messages from messages_with_system (excluding system prompt)
-                        if len(messages_with_system) > 1:
-                            self.state.messages = messages_with_system[1:].copy()
+                        self._sync_messages_from_system(messages_with_system, sync_session=False)
                         
                         # Check and trigger auto-compaction if needed
                         if self._compaction_manager and self._compaction_manager.should_compact(self.state.messages):
@@ -1187,11 +1052,10 @@ class BackendExecutor:
                         })
                         
                         # Log tool call
-                        if self._debug_logger and self._debug_logger.enabled:
-                            self._debug_logger.log_tool_call(
-                                tool_name=tool_name,
-                                arguments=args,
-                            )
+                        self._log_debug_tool_call(
+                            tool_name=tool_name,
+                            arguments=args,
+                        )
                     
                     elif event_type == "tool_result":
                         # Tool execution result
@@ -1226,12 +1090,11 @@ class BackendExecutor:
                         })
                         
                         # Log tool result
-                        if self._debug_logger and self._debug_logger.enabled:
-                            self._debug_logger.log_tool_call(
-                                tool_name=tool_name,
-                                arguments={},
-                                result=result[:500] if len(result) > 500 else result,
-                            )
+                        self._log_debug_tool_call(
+                            tool_name=tool_name,
+                            arguments={},
+                            result=result[:500] if len(result) > 500 else result,
+                        )
                     
                     elif event_type == "error":
                         # Error occurred
@@ -1253,22 +1116,15 @@ class BackendExecutor:
                     break
             
             # Log completion
-            if self._debug_logger and self._debug_logger.enabled:
-                # Find the last assistant message
-                for msg in reversed(self.state.messages):
-                    if msg.get("role") == "assistant" and msg.get("content"):
-                        self._debug_logger.log_message("assistant", msg["content"])
-                        break
+            # Find the last assistant message
+            for msg in reversed(self.state.messages):
+                if msg.get("role") == "assistant" and msg.get("content"):
+                    self._log_debug_message("assistant", msg["content"])
+                    break
             
             # Sync messages from chat_to_next_loop back to state.messages
             # messages_with_system[0] is system prompt, rest are conversation
-            if len(messages_with_system) > 1:
-                # Replace state.messages with the updated conversation (excluding system)
-                self.state.messages = messages_with_system[1:].copy()
-                
-                # Sync to session manager
-                if self._session_manager:
-                    self._session_manager.set_messages(self.state.messages)
+            self._sync_messages_from_system(messages_with_system)
             
         except UserRejectionError as e:
             # 用户拒绝操作且未提供理由 - 回退messages
@@ -1293,12 +1149,11 @@ class BackendExecutor:
             
         except Exception as e:
             # Log error
-            if self._debug_logger and self._debug_logger.enabled:
-                self._debug_logger.log_model_call(
-                    model=self.state.current_model,
-                    request={},
-                    error=str(e)
-                )
+            self._log_debug_model_call(
+                model=self.state.current_model,
+                request={},
+                error=str(e)
+            )
             yield Event(EventType.MODEL_ERROR, {"error": str(e)})
         finally:
             self.state.is_running = False
@@ -1332,111 +1187,36 @@ class BackendExecutor:
                 })
                 
                 # Log tool call start
-                if self._debug_logger and self._debug_logger.enabled:
-                    self._debug_logger.log_tool_call(
-                        tool_name=tool_name,
-                        arguments=arguments,
-                    )
+                self._log_debug_tool_call(
+                    tool_name=tool_name,
+                    arguments=arguments,
+                )
                 
                 # Check if tool requires permission BEFORE execution
                 tool = self._tool_registry.get(tool_name)
-                permission_granted = True
+                result = self._tool_registry.execute(tool_name, **arguments)
+                permission_type = get_permission_request(
+                    tool_name,
+                    tool,
+                    result,
+                    self._permission_manager,
+                )
+                if permission_type:
+                    yield Event(EventType.PERMISSION_REQUEST, {
+                        "tool_name": tool_name,
+                        "permission_type": permission_type.value,
+                        "metadata": result.metadata,
+                    })
                 
-                if tool and getattr(tool, 'requires_permission', False):
-                    # Get metadata preview for permission check
-                    # Execute tool in preview mode to get diff/metadata
-                    result = self._tool_registry.execute(tool_name, **arguments)
-                    
-                    if result.metadata and result.metadata.get("requires_permission"):
-                        # Determine permission type
-                        permission_type = None
-                        if tool_name == "write":
-                            permission_type = PermissionType.WRITE
-                        elif tool_name == "edit":
-                            permission_type = PermissionType.EDIT
-                        elif tool_name == "bash":
-                            if result.metadata.get("has_delete"):
-                                permission_type = PermissionType.BASH_DELETE
-                            else:
-                                permission_type = PermissionType.BASH
-                        
-                        if permission_type:
-                            # Check if already has session permission
-                            if not self._permission_manager.has_session_permission(permission_type):
-                                # Need to request permission - yield permission request event
-                                yield Event(EventType.PERMISSION_REQUEST, {
-                                    "tool_name": tool_name,
-                                    "permission_type": permission_type.value,
-                                    "metadata": result.metadata,
-                                })
-                                
-                                # Get permission response from callback (blocking)
-                                if self._permission_callback:
-                                    callback_result = self._permission_callback(permission_type.value, result.metadata)
-                                    
-                                    # Handle tuple result (response, reason)
-                                    if isinstance(callback_result, tuple):
-                                        response, reason = callback_result
-                                    else:
-                                        # Backward compatibility
-                                        response = callback_result
-                                        reason = None
-                                    
-                                    if response == "always":
-                                        self._permission_manager.grant_session_permission(permission_type)
-                                        permission_granted = True
-                                    elif response == "once":
-                                        permission_granted = True
-                                    else:  # reject
-                                        permission_granted = False
-                                        # Store rejection reason
-                                        if reason:
-                                            result = ToolResult(
-                                                success=False,
-                                                output="",
-                                                error=f"操作被用户拒绝 - {reason}"
-                                            )
-                                else:
-                                    # No callback set - reject by default
-                                    permission_granted = False
-                        
-                        # If permission rejected, return error
-                        if not permission_granted:
-                            # If we haven't set a custom error with reason, use default
-                            if not (result.error and "拒绝" in result.error):
-                                result = ToolResult(
-                                    success=False,
-                                    output="",
-                                    error="操作被用户拒绝"
-                                )
-                        else:
-                            # Permission granted - execute the actual operation
-                            if tool_name in ("write", "edit"):
-                                # File operations - execute with permission
-                                if hasattr(tool, 'execute_with_permission'):
-                                    if tool_name == "write":
-                                        result = tool.execute_with_permission(
-                                            file_path=result.metadata.get("file_path"),
-                                            content=result.metadata.get("content"),
-                                            encoding=result.metadata.get("encoding", "utf-8")
-                                        )
-                                    elif tool_name == "edit":
-                                        result = tool.execute_with_permission(
-                                            file_path=result.metadata.get("file_path"),
-                                            new_content=result.metadata.get("new_content"),
-                                            encoding=result.metadata.get("encoding", "utf-8")
-                                        )
-                            elif tool_name == "bash":
-                                # Bash command - execute with permission
-                                if hasattr(tool, 'execute_with_permission'):
-                                    result = tool.execute_with_permission(
-                                        command=result.metadata.get("command"),
-                                        timeout=result.metadata.get("timeout", 60),
-                                        cwd=result.metadata.get("cwd")
-                                    )
-                else:
-                    # Tool doesn't require permission - execute directly
-                    result = self._tool_registry.execute(tool_name, **arguments)
+                result, rejected_without_reason = execute_with_permissions(
+                    tool_name,
+                    tool,
+                    result,
+                    self._permission_manager,
+                    self._permission_callback,
+                )
+                if rejected_without_reason:
+                    self.state.user_rejected_without_reason = True
                 
                 # Get output for agent - include error message if present
                 tool_output = result.output
@@ -1460,12 +1240,11 @@ class BackendExecutor:
                     )
                 
                 # Log tool result
-                if self._debug_logger and self._debug_logger.enabled:
-                    self._debug_logger.log_tool_call(
-                        tool_name=tool_name,
-                        arguments=arguments,
-                        result=tool_output[:500] if len(tool_output) > 500 else tool_output,
-                    )
+                self._log_debug_tool_call(
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    result=tool_output[:500] if len(tool_output) > 500 else tool_output,
+                )
                 
                 yield Event(EventType.TOOL_RESULT, {
                     "tool_name": tool_name,
@@ -1479,12 +1258,11 @@ class BackendExecutor:
                 error_msg = str(e)
                 
                 # Log tool error
-                if self._debug_logger and self._debug_logger.enabled:
-                    self._debug_logger.log_tool_call(
-                        tool_name=tool_name,
-                        arguments=arguments,
-                        error=error_msg,
-                    )
+                self._log_debug_tool_call(
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    error=error_msg,
+                )
                 
                 yield Event(EventType.TOOL_RESULT, {
                     "tool_name": tool_name,
@@ -1529,13 +1307,14 @@ class BackendExecutor:
             return self._session_manager.save_current_session()
         return False
     
-    def set_debug_mode(self, enabled: bool) -> None:
+    def set_debug_mode(self, enabled: bool) -> Optional[str]:
         """
         Set debug mode.
         
         Args:
             enabled: Whether to enable debug mode
         """
+        log_path: Optional[str] = None
         if self._debug_logger:
             if enabled:
                 self._debug_logger.enable()
@@ -1546,11 +1325,13 @@ class BackendExecutor:
                         session.session_id
                     )
             else:
-                self._debug_logger.end_session()
+                log_path = self._debug_logger.end_session()
                 self._debug_logger.disable()
         
         if self._config_manager:
             self._config_manager.config.debug_mode = enabled
+
+        return log_path
     
     def execute_init_command(self) -> Generator[Event, None, None]:
         """

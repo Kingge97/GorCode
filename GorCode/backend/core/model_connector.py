@@ -36,8 +36,8 @@ try:
 except ImportError as e:
     print(f"Warning: Could not import GorAI_LLMClient: {e}")
 
-from backend.config.manager import ModelConnection
-from backend.core.events import EventBus, Event, EventType
+from GorCode.backend.config.manager import ModelConnection
+from GorCode.backend.core.events import EventBus, Event, EventType
 
 
 @dataclass

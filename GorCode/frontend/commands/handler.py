@@ -5,87 +5,46 @@ Command Handler
 Handles user commands in the CLI.
 """
 
+import argparse
 from typing import Any, Dict, List, Optional, Callable
 from pathlib import Path
 from datetime import datetime
 
-from backend.core.executor import BackendExecutor
-from backend.core.events import EventType
-from backend.config.manager import ConfigManager
-from backend.config.initializer import ProjectInitializer, InitResult
-from backend.agents.base import AgentRegistry
-from backend.session import SessionManager, SessionStorage, DebugLogger
-from backend.mcp import create_mcp_tools
-from frontend.ui.renderer import UIRenderer
+from GorCode.frontend.ui.renderer import UIRenderer
+from GorCode.frontend.ui.init_render import render_init_result
+from GorCode.bridge.inprocess import FrontendClient
+from GorCode.frontend.commands.registry import COMMAND_SPECS
 
 
 class CommandHandler:
     """
     Handler for user commands.
-    
-    Supports commands:
-    - /help - Show help
-    - /agent - Switch agent
-    - /model - Switch model
-    - /init - Initialize project
-    - /mcps - Manage MCPs
-    - /skills - Manage skills
-    - /new - New session
-    - /history - View history
-    - /debug - Toggle debug mode
-    - /exit - Exit
+
+    Supports commands defined in frontend.commands.registry.COMMAND_SPECS.
     """
     
     def __init__(
         self,
-        executor: BackendExecutor,
-        config_manager: ConfigManager,
+        client: FrontendClient,
         ui_renderer: UIRenderer,
     ):
         """
         Initialize command handler.
         
         Args:
-            executor: Backend executor
-            config_manager: Configuration manager
+            client: Frontend client
             ui_renderer: UI renderer
         """
-        self.executor = executor
-        self.config_manager = config_manager
+        self.client = client
         self.ui_renderer = ui_renderer
-        self.agent_registry = AgentRegistry()
+        self._config_cache: Optional[Dict[str, Any]] = None
         
-        # Initialize session manager
-        project_path = str(config_manager.project_path) if config_manager else ""
-        self.session_manager = SessionManager(
-            event_bus=executor.event_bus if executor else None,
-            storage=SessionStorage(),
-            project_path=project_path,
-        )
-        
-        # Initialize debug logger
-        self.debug_logger = DebugLogger(
-            base_path=project_path,
-            enabled=config_manager.config.debug_mode if config_manager else False,
-        )
-        
-        # Command registry
-        self._commands: Dict[str, Callable] = {
-            "help": self._cmd_help,
-            "agent": self._cmd_agent,
-            "model": self._cmd_model,
-            "init": self._cmd_init,
-            "mcps": self._cmd_mcps,
-            "skills": self._cmd_skills,
-            "new": self._cmd_new,
-            "history": self._cmd_history,
-            "debug": self._cmd_debug,
-            "compact": self._cmd_compact,
-            "context": self._cmd_context,
-            "permission": self._cmd_permission,
-            "exit": self._cmd_exit,
-            "quit": self._cmd_exit,
-        }
+        # Command registry (single source: COMMAND_SPECS)
+        self._commands: Dict[str, Callable] = {}
+        for spec in COMMAND_SPECS:
+            handler = getattr(self, spec.handler)
+            for key in spec.keys:
+                self._commands[key] = handler
     
     def handle(self, command: str) -> bool:
         """
@@ -118,6 +77,24 @@ class CommandHandler:
             self.ui_renderer.print_error(f"Unknown command: /{cmd}")
             self.ui_renderer.print("Type /help for available commands", style="dim")
             return True
+
+    def _parse_args(self, parser: argparse.ArgumentParser, args: str) -> Optional[argparse.Namespace]:
+        """Parse args with unified error handling."""
+        try:
+            return parser.parse_args(args.split() if args else [])
+        except SystemExit:
+            return None
+
+    def _get_config(self, refresh: bool = False) -> Dict[str, Any]:
+        """Fetch merged config from backend (cached)."""
+        if self._config_cache is not None and not refresh:
+            return self._config_cache
+        resp = self.client.request("config.get", {"scope": "merged"})
+        if resp.get("success"):
+            self._config_cache = resp.get("payload", {}).get("config", {}) or {}
+        else:
+            self._config_cache = {}
+        return self._config_cache
     
     def _cmd_help(self, args: str) -> bool:
         """Handle /help command."""
@@ -128,25 +105,30 @@ class CommandHandler:
         """Handle /agent command."""
         if not args:
             # List available agents
-            agents = self.agent_registry.get_visible_agents()
+            response = self.client.request("agent.list", {"visibility": "visible"})
+            agents = response.get("payload", {}).get("agents", []) if response.get("success") else []
             self.ui_renderer.render_agent_list(agents)
             return True
         
         agent_name = args.strip().lower()
-        agent = self.agent_registry.get(agent_name)
-        
-        if agent is None:
+
+        agent_resp = self.client.request("agent.get", {"name": agent_name})
+        if not agent_resp.get("success"):
             self.ui_renderer.print_error(f"Agent not found: {agent_name}")
-            self.ui_renderer.print("Available agents: " + 
-                ", ".join(a.name for a in self.agent_registry.get_visible_agents()),
-                style="dim")
+            list_resp = self.client.request("agent.list", {"visibility": "visible"})
+            agents = list_resp.get("payload", {}).get("agents", []) if list_resp.get("success") else []
+            names = [a.get("name", "") for a in agents if isinstance(a, dict)]
+            if names:
+                self.ui_renderer.print("Available agents: " + ", ".join(names), style="dim")
             return True
-        
-        # Switch agent
-        if self.executor.switch_agent(agent_name):
+
+        response = self.client.request("agent.switch", {"name": agent_name})
+        if response.get("success"):
             self.ui_renderer.print_success(f"Switched to agent: {agent_name}")
-            if agent.description:
-                self.ui_renderer.print(agent.description, style="dim")
+            agent = agent_resp.get("payload", {}).get("agent", {})
+            description = agent.get("description") if isinstance(agent, dict) else None
+            if description:
+                self.ui_renderer.print(description, style="dim")
         else:
             self.ui_renderer.print_error(f"Failed to switch to agent: {agent_name}")
         
@@ -156,26 +138,27 @@ class CommandHandler:
         """Handle /model command."""
         if not args:
             # List available models
-            config = self.config_manager.config
-            self.ui_renderer.render_model_list(config.model_connections)
+            config = self._get_config()
+            self.ui_renderer.render_model_list(config.get("model_connections", {}))
             return True
         
         model_name = args.strip().lower()
         
-        if self.executor.switch_model(model_name):
+        response = self.client.request("model.switch", {"model": model_name})
+        if response.get("success"):
             self.ui_renderer.print_success(f"Switched to model: {model_name}")
         else:
             self.ui_renderer.print_error(f"Model not found: {model_name}")
-            config = self.config_manager.config
-            available = list(config.model_connections.keys())
+            available = response.get("payload", {}).get("available") or []
+            if not available:
+                config = self._get_config()
+                available = list((config.get("model_connections") or {}).keys())
             self.ui_renderer.print("Available models: " + ", ".join(available), style="dim")
         
         return True
     
     def _cmd_init(self, args: str) -> bool:
         """Handle /init command."""
-        import argparse
-        
         # Parse arguments
         parser = argparse.ArgumentParser(prog="/init", add_help=False)
         parser.add_argument("path", nargs="?", default="", help="Project path")
@@ -184,9 +167,8 @@ class CommandHandler:
         parser.add_argument("--project-only", action="store_true", help="Initialize project config only")
         parser.add_argument("--gorcode", action="store_true", help="Generate GORCODE.md file for the project")
         
-        try:
-            parsed = parser.parse_args(args.split() if args else [])
-        except SystemExit:
+        parsed = self._parse_args(parser, args)
+        if parsed is None:
             return True
         
         # Check if --gorcode flag is set
@@ -196,36 +178,10 @@ class CommandHandler:
             self.ui_renderer.print("[bold]Generating GORCODE.md[/bold]")
             self.ui_renderer.print()
             
-            # Execute init command through executor
+            # Execute init command through protocol stream
             try:
-                for event in self.executor.execute_init_command():
-                    # Handle events from executor
-                    event_type = event.event_type
-                    event_data = event.data
-                    
-                    if event_type == EventType.UI_MESSAGE:
-                        self.ui_renderer.print(event_data.get("message", ""))
-                    elif event_type == EventType.MODEL_ANSWER:
-                        # Stream model answer directly to console
-                        content = event_data.get("content", "")
-                        if content:
-                            self.ui_renderer.console.print(content, end="")
-                    elif event_type == EventType.MODEL_TOOL_CALL:
-                        tool_name = event_data.get("name", "unknown")
-                        self.ui_renderer.print(f"[dim]Using tool: {tool_name}[/dim]")
-                    elif event_type == EventType.TOOL_EXECUTION_START:
-                        tool_name = event_data.get("tool_name", "unknown")
-                        self.ui_renderer.print(f"[dim]Executing: {tool_name}[/dim]")
-                    elif event_type == EventType.TOOL_RESULT:
-                        # Show tool result summary
-                        tool_name = event_data.get("tool_name", "unknown")
-                        success = event_data.get("success", False)
-                        if success:
-                            self.ui_renderer.print(f"[dim]✓ {tool_name} completed[/dim]")
-                    elif event_type == EventType.MODEL_ERROR:
-                        self.ui_renderer.print_error(event_data.get("error", "Unknown error"))
-                    elif event_type == EventType.MODEL_END:
-                        self.ui_renderer.print()
+                for event in self.client.stream("init.generate", {}):
+                    self.ui_renderer.render_event(event)
             except Exception as e:
                 self.ui_renderer.print_error(f"Failed to generate GORCODE.md: {e}")
             
@@ -240,77 +196,51 @@ class CommandHandler:
         self.ui_renderer.print(f"Project path: {project_path}", style="dim")
         self.ui_renderer.print()
         
-        # Create initializer
-        initializer = ProjectInitializer(project_path=str(project_path))
+        payload = {
+            "path": str(project_path),
+            "force": parsed.force,
+            "user_only": parsed.user_only,
+            "project_only": parsed.project_only,
+        }
+        response = self.client.request("config.initialize", payload)
+
+        if not response.get("success"):
+            self.ui_renderer.print_error(response.get("error") or "Failed to initialize config")
+            return True
         
-        # Get current status
-        status = initializer.get_config_status()
-        
-        # Initialize based on flags
+        # Refresh config cache after initialization
+        self._config_cache = None
+
+        data = response.get("payload", {})
         if parsed.user_only:
-            # Initialize user config only
-            result = initializer.initialize_user_config(force=parsed.force)
-            self._render_init_result("User", result, status["user_config"]["path"])
+            render_init_result(self.ui_renderer, "User", data.get("result", {}))
         elif parsed.project_only:
-            # Initialize project config only
-            result = initializer.initialize_project_config(force=parsed.force)
-            self._render_init_result("Project", result, status["project_config"]["path"])
+            render_init_result(self.ui_renderer, "Project", data.get("result", {}))
         else:
-            # Initialize both
-            results = initializer.initialize_all(force=parsed.force)
-            self._render_init_result("User", results["user"], status["user_config"]["path"])
-            self._render_init_result("Project", results["project"], status["project_config"]["path"])
+            results = data.get("results", {}) if isinstance(data, dict) else {}
+            render_init_result(self.ui_renderer, "User", results.get("user", {}))
+            render_init_result(self.ui_renderer, "Project", results.get("project", {}))
         
         return True
     
-    def _render_init_result(self, name: str, result: InitResult, path: str) -> None:
-        """Render initialization result."""
-        if result.success:
-            self.ui_renderer.print_success(f"{name} configuration: {result.message}")
-            if result.created_paths:
-                self.ui_renderer.print(f"  Created:", style="dim")
-                for p in result.created_paths:
-                    self.ui_renderer.print(f"    • {p}", style="dim")
-        else:
-            self.ui_renderer.print_error(f"{name} configuration: {result.message}")
-            for error in result.errors:
-                self.ui_renderer.print(f"  Error: {error}", style="dim")
-    
     def _cmd_mcps(self, args: str) -> bool:
         """Handle /mcps command."""
-        import argparse
-        
         parser = argparse.ArgumentParser(prog="/mcps", add_help=False)
         parser.add_argument("action", nargs="?", default="list", help="Action: list, connect, disconnect, status")
         parser.add_argument("name", nargs="?", default="", help="Server name")
         parser.add_argument("--all", "-a", action="store_true", help="Apply to all servers")
         
-        try:
-            parsed = parser.parse_args(args.split() if args else [])
-        except SystemExit:
+        parsed = self._parse_args(parser, args)
+        if parsed is None:
             return True
-        
-        from backend.mcp import MCPManager, MCPServerConfig, MCPConnectionStatus
-        import asyncio
-        
-        mcp_manager = getattr(self.executor, '_mcp_manager', None)
-        if not mcp_manager:
-            # Get encoding from config (default to utf-8)
-            config = self.config_manager.config
-            encoding = getattr(config, 'default_encoding', 'utf-8') or 'utf-8'
-            mcp_manager = MCPManager(encoding=encoding)
-            # Load from config
-            if config.mcp_servers:
-                mcp_manager.load_from_config(config.mcp_servers)
-            self.executor._mcp_manager = mcp_manager
-        
+
         action = parsed.action.lower()
         
         if action == "list":
             self.ui_renderer.print()
             self.ui_renderer.print("[bold]MCP Servers:[/bold]")
-            
-            status = mcp_manager.get_status()
+            response = self.client.request("mcp.list", {})
+            status = response.get("payload", {}).get("status", {})
             if not status:
                 self.ui_renderer.print("  [dim]No MCP servers configured.[/dim]")
                 self.ui_renderer.print("  [dim]Add servers to ~/.gorcode/config.json[/dim]")
@@ -338,82 +268,49 @@ class CommandHandler:
         elif action == "connect":
             if parsed.all:
                 self.ui_renderer.print("[dim]Connecting to all MCP servers...[/dim]")
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    results = loop.run_until_complete(mcp_manager.connect_all())
-                    for name, success in results.items():
-                        if success:
-                            self.ui_renderer.print_success(f"Connected to {name}")
-                        else:
-                            self.ui_renderer.print_error(f"Failed to connect to {name}")
-                    
-                    # Register MCP tools to tool registry after successful connections
-                    if any(results.values()):
-                        self._register_mcp_tools(mcp_manager)
-                finally:
-                    loop.close()
+                response = self.client.request("mcp.connect", {"all": True})
+                results = response.get("payload", {}).get("results", {})
+                errors = response.get("payload", {}).get("errors", {})
+                for name, success in results.items():
+                    if success:
+                        self.ui_renderer.print_success(f"Connected to {name}")
+                    else:
+                        error_msg = errors.get(name, "Unknown error")
+                        self.ui_renderer.print_error(f"Failed to connect to {name}: {error_msg}")
             elif parsed.name:
                 self.ui_renderer.print(f"[dim]Connecting to {parsed.name}...[/dim]")
-                
-                # Debug: show server config
-                connection = mcp_manager.get_connection(parsed.name)
-                if connection:
-                    self.ui_renderer.print(f"[dim]  Command: {connection.config.command}[/dim]")
-                    self.ui_renderer.print(f"[dim]  Args: {connection.config.args}[/dim]")
+                response = self.client.request("mcp.connect", {"name": parsed.name})
+                results = response.get("payload", {}).get("results", {})
+                errors = response.get("payload", {}).get("errors", {})
+                success = results.get(parsed.name, False)
+                if success:
+                    self.ui_renderer.print_success(f"Connected to {parsed.name}")
                 else:
-                    self.ui_renderer.print_error(f"Server '{parsed.name}' not found in configuration")
-                    self.ui_renderer.print(f"[dim]Available servers: {list(mcp_manager.get_all_connections().keys())}[/dim]")
-                    return True
-                
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    success = loop.run_until_complete(mcp_manager.connect(parsed.name))
-                    if success:
-                        self.ui_renderer.print_success(f"Connected to {parsed.name}")
-                        # Register MCP tools after successful connection
-                        self._register_mcp_tools(mcp_manager)
-                    else:
-                        error_msg = connection.error_message or "Unknown error"
-                        self.ui_renderer.print_error(f"Failed to connect to {parsed.name}: {error_msg}")
-                finally:
-                    loop.close()
+                    error_msg = errors.get(parsed.name, "Unknown error")
+                    self.ui_renderer.print_error(f"Failed to connect to {parsed.name}: {error_msg}")
             else:
                 self.ui_renderer.print_error("Specify server name or use --all")
                 
         elif action == "disconnect":
             if parsed.all:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    results = loop.run_until_complete(mcp_manager.disconnect_all())
-                    for name in results:
-                        self.ui_renderer.print(f"[dim]Disconnected from {name}[/dim]")
-                    
-                    # Unregister all MCP tools after disconnecting all servers
-                    if results:
-                        self._unregister_mcp_tools(mcp_manager)
-                finally:
-                    loop.close()
-            elif parsed.name:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    success = loop.run_until_complete(mcp_manager.disconnect(parsed.name))
+                response = self.client.request("mcp.disconnect", {"all": True})
+                results = response.get("payload", {}).get("results", {})
+                for name, success in results.items():
                     if success:
-                        self.ui_renderer.print(f"[dim]Disconnected from {parsed.name}[/dim]")
-                        # Unregister MCP tools for this server
-                        self._unregister_mcp_tools(mcp_manager, parsed.name)
-                    else:
-                        self.ui_renderer.print_error(f"Failed to disconnect from {parsed.name}")
-                finally:
-                    loop.close()
+                        self.ui_renderer.print(f"[dim]Disconnected from {name}[/dim]")
+            elif parsed.name:
+                response = self.client.request("mcp.disconnect", {"name": parsed.name})
+                results = response.get("payload", {}).get("results", {})
+                if results.get(parsed.name):
+                    self.ui_renderer.print(f"[dim]Disconnected from {parsed.name}[/dim]")
+                else:
+                    self.ui_renderer.print_error(f"Failed to disconnect from {parsed.name}")
             else:
                 self.ui_renderer.print_error("Specify server name or use --all")
         
         elif action == "status":
-            status = mcp_manager.get_status()
+            response = self.client.request("mcp.status", {})
+            status = response.get("payload", {}).get("status", {})
             self.ui_renderer.print()
             self.ui_renderer.print("[bold]MCP Status:[/bold]")
             
@@ -429,47 +326,39 @@ class CommandHandler:
     
     def _cmd_skills(self, args: str) -> bool:
         """Handle /skills command."""
-        import argparse
-        
         parser = argparse.ArgumentParser(prog="/skills", add_help=False)
         parser.add_argument("action", nargs="?", default="list", help="Action: list, enable, disable, reload, show")
         parser.add_argument("name", nargs="?", default="", help="Skill name")
         parser.add_argument("--all", "-a", action="store_true", help="Apply to all skills")
         
-        try:
-            parsed = parser.parse_args(args.split() if args else [])
-        except SystemExit:
+        parsed = self._parse_args(parser, args)
+        if parsed is None:
             return True
-        
-        from backend.skills import SkillLoader, SkillInjector
-        
-        skill_loader = getattr(self.executor, '_skill_loader', None)
-        if not skill_loader:
-            skill_loader = SkillLoader()
-            # Add search paths
-            skills_dir = self.config_manager.get_project_config_dir() / "skills"
-            if skills_dir.exists():
-                skill_loader.add_search_path(str(skills_dir))
-            skill_loader.load_all_skills()
-            self.executor._skill_loader = skill_loader
         
         action = parsed.action.lower()
         
         if action == "list":
             self.ui_renderer.print()
             self.ui_renderer.print("[bold]Available Skills:[/bold]")
-            
-            skills = skill_loader.get_all_skills()
+            response = self.client.request("skills.list", {})
+            skills = response.get("payload", {}).get("skills", [])
             if not skills:
                 self.ui_renderer.print("  [dim]No skills found.[/dim]")
-                skills_dir = self.config_manager.get_project_config_dir() / "skills"
+                status = self.client.request("config.status", {})
+                project_config = status.get("payload", {}).get("paths", {}).get("project") if status.get("success") else ""
+                if project_config:
+                    skills_dir = Path(project_config).parent / "skills"
+                else:
+                    skills_dir = Path(".gorcode") / "skills"
                 self.ui_renderer.print(f"  [dim]Add skill directories to {skills_dir}[/dim]")
             else:
-                for name, skill in skills.items():
-                    status = "[green]enabled[/green]" if skill.enabled else "[dim]disabled[/dim]"
+                for skill in skills:
+                    status = "[green]enabled[/green]" if skill.get("enabled") else "[dim]disabled[/dim]"
+                    name = skill.get("name", "unknown")
+                    desc = skill.get("description", "")
                     self.ui_renderer.print(f"  [cyan]{name}[/cyan] - {status}")
-                    if skill.description:
-                        self.ui_renderer.print(f"    [dim]{skill.description[:100]}[/dim]")
+                    if desc:
+                        self.ui_renderer.print(f"    [dim]{desc[:100]}[/dim]")
             
             self.ui_renderer.print()
             self.ui_renderer.print("[dim]Usage: /skills show <name> | /skills enable <name> | /skills disable <name>[/dim]")
@@ -478,26 +367,29 @@ class CommandHandler:
             if not parsed.name:
                 self.ui_renderer.print_error("Specify skill name")
                 return True
-            
-            skill = skill_loader.get_skill(parsed.name)
-            if not skill:
+
+            response = self.client.request("skills.show", {"name": parsed.name})
+            if not response.get("success"):
                 self.ui_renderer.print_error(f"Skill not found: {parsed.name}")
                 return True
-            
+
+            skill = response.get("payload", {})
             self.ui_renderer.print()
-            self.ui_renderer.print(f"[bold cyan]{skill.name}[/bold cyan]")
-            if skill.description:
-                self.ui_renderer.print(f"[dim]{skill.description}[/dim]")
+            self.ui_renderer.print(f"[bold cyan]{skill.get('name', parsed.name)}[/bold cyan]")
+            if skill.get("description"):
+                self.ui_renderer.print(f"[dim]{skill.get('description')}[/dim]")
             self.ui_renderer.print()
-            self.ui_renderer.print(skill.content[:500])
-            if len(skill.content) > 500:
+            content = skill.get("content", "")
+            self.ui_renderer.print(content[:500])
+            if len(content) > 500:
                 self.ui_renderer.print("[dim]... (truncated)[/dim]")
             self.ui_renderer.print()
-            self.ui_renderer.print(f"[dim]Resources: {len(skill.resources)}[/dim]")
+            self.ui_renderer.print(f"[dim]Resources: {skill.get('resource_count', 0)}[/dim]")
             
         elif action == "enable":
             if parsed.name:
-                if skill_loader.enable_skill(parsed.name):
+                response = self.client.request("skills.enable", {"name": parsed.name})
+                if response.get("success"):
                     self.ui_renderer.print_success(f"Enabled skill: {parsed.name}")
                 else:
                     self.ui_renderer.print_error(f"Skill not found: {parsed.name}")
@@ -506,7 +398,8 @@ class CommandHandler:
                 
         elif action == "disable":
             if parsed.name:
-                if skill_loader.disable_skill(parsed.name):
+                response = self.client.request("skills.disable", {"name": parsed.name})
+                if response.get("success"):
                     self.ui_renderer.print(f"[dim]Disabled skill: {parsed.name}[/dim]")
                 else:
                     self.ui_renderer.print_error(f"Skill not found: {parsed.name}")
@@ -515,60 +408,44 @@ class CommandHandler:
         
         elif action == "reload":
             if parsed.name:
-                skill = skill_loader.reload_skill(parsed.name)
-                if skill:
+                response = self.client.request("skills.reload", {"name": parsed.name})
+                if response.get("success"):
                     self.ui_renderer.print_success(f"Reloaded skill: {parsed.name}")
                 else:
                     self.ui_renderer.print_error(f"Failed to reload: {parsed.name}")
             else:
-                # Reload all
-                skill_loader.load_all_skills()
-                self.ui_renderer.print_success("Reloaded all skills")
+                response = self.client.request("skills.reload", {})
+                if response.get("success"):
+                    self.ui_renderer.print_success("Reloaded all skills")
         
         return True
     
     def _cmd_new(self, args: str) -> bool:
         """Handle /new command."""
-        import argparse
-        
         parser = argparse.ArgumentParser(prog="/new", add_help=False)
         parser.add_argument("-s", "--save", action="store_true", help="Save current session before creating new")
         parser.add_argument("-t", "--title", default="", help="Title for the new session")
         
-        try:
-            parsed = parser.parse_args(args.split() if args else [])
-        except SystemExit:
+        parsed = self._parse_args(parser, args)
+        if parsed is None:
             return True
         
         # Save current session if requested or if it has messages
-        if parsed.save and self.session_manager.has_session:
-            if self.session_manager.save_current_session():
+        if parsed.save:
+            save_resp = self.client.request("session.save", {})
+            if save_resp.get("success"):
                 self.ui_renderer.print_success("Current session saved")
         
-        # End debug session if active
-        if self.debug_logger.enabled:
-            log_path = self.debug_logger.end_session()
-            if log_path:
-                self.ui_renderer.print(f"Debug log saved: {log_path}", style="dim")
-        
-        # Create new session
-        agent = self.executor.state.current_agent if self.executor else "build"
-        model = self.executor.state.current_model if self.executor else "main"
-        
-        session = self.session_manager.create_session(
-            agent=agent,
-            model=model,
-            title=parsed.title,
-        )
-        
-        # Reset executor messages
-        self.executor.reset_messages()
-        
-        # Start debug session if enabled
-        if self.debug_logger.enabled:
-            self.debug_logger.start_session(agent, session.session_id)
-        
-        self.ui_renderer.print_success(f"Started new session: {session.session_id}")
+        response = self.client.request("session.new", {"title": parsed.title})
+        if not response.get("success"):
+            self.ui_renderer.print_error(response.get("error") or "Failed to start new session")
+            return True
+
+        session_id = response.get("payload", {}).get("session_id")
+        if session_id:
+            self.ui_renderer.print_success(f"Started new session: {session_id}")
+        else:
+            self.ui_renderer.print_success("Started new session")
         if parsed.title:
             self.ui_renderer.print(f"Title: {parsed.title}", style="dim")
         
@@ -576,17 +453,14 @@ class CommandHandler:
     
     def _cmd_history(self, args: str) -> bool:
         """Handle /history command."""
-        import argparse
-        
         parser = argparse.ArgumentParser(prog="/history", add_help=False)
         parser.add_argument("action", nargs="?", default="list", help="Action: list, load, search, delete, info")
         parser.add_argument("target", nargs="?", default="", help="Session ID or search query")
         parser.add_argument("-l", "--limit", type=int, default=10, help="Number of results")
         parser.add_argument("-o", "--offset", type=int, default=0, help="Offset for pagination")
         
-        try:
-            parsed = parser.parse_args(args.split() if args else [])
-        except SystemExit:
+        parsed = self._parse_args(parser, args)
+        if parsed is None:
             return True
         
         action = parsed.action.lower()
@@ -617,31 +491,37 @@ class CommandHandler:
         """List history sessions."""
         self.ui_renderer.print()
         self.ui_renderer.print("[bold]Session History[/bold]")
-        
-        sessions = self.session_manager.list_sessions(limit=limit, offset=offset)
-        
+
+        response = self.client.request(
+            "session.list",
+            {"limit": limit, "offset": offset},
+        )
+        sessions = response.get("payload", {}).get("sessions", []) if response.get("success") else []
+
         if not sessions:
             self.ui_renderer.print("  [dim]No sessions found.[/dim]")
             self.ui_renderer.print("  [dim]Sessions are automatically saved when you start a new one.[/dim]")
             return
         
         for session in sessions:
-            # Format timestamps
-            created = session.created_at.strftime("%Y-%m-%d %H:%M")
-            updated = session.updated_at.strftime("%Y-%m-%d %H:%M")
-            
-            # Format title
-            title = session.title or f"Session {session.session_id}"
+            created_at = session.get("created_at", "")
+            updated_at = session.get("updated_at", "")
+            created = datetime.fromisoformat(created_at).strftime("%Y-%m-%d %H:%M") if created_at else "N/A"
+            updated = datetime.fromisoformat(updated_at).strftime("%Y-%m-%d %H:%M") if updated_at else "N/A"
+
+            title = session.get("title") or f"Session {session.get('session_id', 'unknown')}"
             if len(title) > 40:
                 title = title[:37] + "..."
             
             self.ui_renderer.print()
-            self.ui_renderer.print(f"  [cyan]{session.session_id}[/cyan] - {title}")
-            self.ui_renderer.print(f"    [dim]Agent: {session.agent} | Messages: {session.message_count}[/dim]")
+            self.ui_renderer.print(f"  [cyan]{session.get('session_id', 'unknown')}[/cyan] - {title}")
+            self.ui_renderer.print(
+                f"    [dim]Agent: {session.get('agent', 'build')} | Messages: {session.get('message_count', 0)}[/dim]"
+            )
             self.ui_renderer.print(f"    [dim]Created: {created} | Updated: {updated}[/dim]")
         
         # Show pagination info
-        total = self.session_manager.get_session_count()
+        total = response.get("payload", {}).get("total", len(sessions))
         if total > limit:
             self.ui_renderer.print()
             self.ui_renderer.print(f"  [dim]Showing {offset + 1}-{min(offset + limit, total)} of {total} sessions[/dim]")
@@ -656,40 +536,15 @@ class CommandHandler:
             self.ui_renderer.print_error("Specify session ID")
             self.ui_renderer.print("Usage: /history load <session_id>", style="dim")
             return
-        
-        # Check if session exists
-        if not self.session_manager.storage.exists(session_id):
-            self.ui_renderer.print_error(f"Session not found: {session_id}")
-            return
-        
-        # Save current session
-        if self.session_manager.has_session:
-            self.session_manager.save_current_session()
-        
-        # End debug session
-        if self.debug_logger.enabled:
-            self.debug_logger.end_session()
-        
-        # Load session
-        session = self.session_manager.load_session(session_id)
-        
-        if session:
-            # Load messages into executor
-            self.executor.load_messages(session.get_messages_for_model())
-            
-            # Switch to session's agent/model
-            if session.metadata.agent:
-                self.executor.switch_agent(session.metadata.agent)
-            if session.metadata.model:
-                self.executor.switch_model(session.metadata.model)
-            
-            # Start debug session
-            if self.debug_logger.enabled:
-                self.debug_logger.start_session(session.metadata.agent, session.session_id)
-            
+
+        response = self.client.request("session.load", {"session_id": session_id})
+        if response.get("success"):
+            metadata = response.get("payload", {}).get("metadata", {})
+            title = metadata.get("title") or f"Session {metadata.get('session_id', session_id)}"
+            message_count = metadata.get("message_count", 0)
             self.ui_renderer.print_success(f"Loaded session: {session_id}")
-            self.ui_renderer.print(f"  Title: {session.title}", style="dim")
-            self.ui_renderer.print(f"  Messages: {len(session.messages)}", style="dim")
+            self.ui_renderer.print(f"  Title: {title}", style="dim")
+            self.ui_renderer.print(f"  Messages: {message_count}", style="dim")
         else:
             self.ui_renderer.print_error(f"Failed to load session: {session_id}")
     
@@ -702,62 +557,47 @@ class CommandHandler:
         
         self.ui_renderer.print()
         self.ui_renderer.print(f"[bold]Search Results for '{query}'[/bold]")
-        
-        results = self.session_manager.search_sessions(query, limit)
-        
+
+        response = self.client.request("session.search", {"query": query, "limit": limit})
+        results = response.get("payload", {}).get("results", []) if response.get("success") else []
+
         if not results:
             self.ui_renderer.print("  [dim]No matching sessions found.[/dim]")
             return
         
         for result in results:
-            title = result.title or f"Session {result.session_id}"
+            title = result.get("title") or f"Session {result.get('session_id', 'unknown')}"
             self.ui_renderer.print()
-            self.ui_renderer.print(f"  [cyan]{result.session_id}[/cyan] - {title}")
-            if result.preview:
-                self.ui_renderer.print(f"    [dim]Preview: {result.preview}[/dim]")
-            self.ui_renderer.print(f"    [dim]Messages: {result.message_count}[/dim]")
+            self.ui_renderer.print(f"  [cyan]{result.get('session_id', 'unknown')}[/cyan] - {title}")
+            preview = result.get("preview")
+            if preview:
+                self.ui_renderer.print(f"    [dim]Preview: {preview}[/dim]")
+            self.ui_renderer.print(f"    [dim]Messages: {result.get('message_count', 0)}[/dim]")
     
     def _history_delete(self, session_id: str) -> None:
         """Delete a history session."""
         if not session_id:
             self.ui_renderer.print_error("Specify session ID")
             return
-        
-        # Check if trying to delete current session
-        if (self.session_manager.current_session and 
-            self.session_manager.current_session.session_id == session_id):
-            self.ui_renderer.print_error("Cannot delete current session")
-            self.ui_renderer.print("Start a new session first with /new", style="dim")
-            return
-        
-        if self.session_manager.delete_session(session_id):
+
+        response = self.client.request("session.delete", {"session_id": session_id})
+        if response.get("success"):
             self.ui_renderer.print_success(f"Deleted session: {session_id}")
         else:
-            self.ui_renderer.print_error(f"Failed to delete session: {session_id}")
+            error = response.get("error") or "Failed to delete session"
+            self.ui_renderer.print_error(error)
     
     def _history_info(self, session_id: str) -> None:
         """Show session info."""
-        if not session_id:
-            # Show current session info
-            info = self.session_manager.get_session_info()
-            if not info.get("active"):
-                self.ui_renderer.print("No active session", style="dim")
-                return
-        else:
-            # Load specific session info
-            session = self.session_manager.storage.load(session_id)
-            if not session:
-                self.ui_renderer.print_error(f"Session not found: {session_id}")
-                return
-            info = {
-                "session_id": session.session_id,
-                "title": session.title,
-                "agent": session.metadata.agent,
-                "model": session.metadata.model,
-                "message_count": len(session.messages),
-                "created_at": session.metadata.created_at.isoformat(),
-                "updated_at": session.metadata.updated_at.isoformat(),
-            }
+        response = self.client.request(
+            "session.info",
+            {"session_id": session_id} if session_id else {},
+        )
+        if not response.get("success"):
+            self.ui_renderer.print_error(response.get("error") or "Session not found")
+            return
+
+        info = response.get("payload", {}).get("metadata", {})
         
         self.ui_renderer.print()
         self.ui_renderer.print("[bold]Session Info[/bold]")
@@ -771,68 +611,88 @@ class CommandHandler:
     
     def _history_clear(self) -> None:
         """Clear all history (with confirmation)."""
-        count = self.session_manager.get_session_count()
-        if count == 0:
+        list_resp = self.client.request("session.list", {"limit": 10000, "offset": 0})
+        sessions = list_resp.get("payload", {}).get("sessions", []) if list_resp.get("success") else []
+        session_ids = [s.get("session_id") for s in sessions if isinstance(s, dict)]
+        session_ids = [sid for sid in session_ids if sid]
+
+        if not session_ids:
             self.ui_renderer.print("No sessions to clear", style="dim")
             return
+
+        status = self.client.request("session.status", {})
+        current_id = status.get("payload", {}).get("session_id") if status.get("success") else None
+
+        deletable_ids = [session_id for session_id in session_ids if session_id != current_id]
         
-        self.ui_renderer.print(f"[yellow]This will delete {count} session(s).[/yellow]")
-        self.ui_renderer.print("Type 'yes' to confirm: ", style="dim")
+        if not deletable_ids:
+            self.ui_renderer.print("No sessions to clear (current session is active)", style="dim")
+            return
         
-        # Note: In a real implementation, we'd get user input here
-        # For now, just show the warning
-        self.ui_renderer.print("Operation cancelled (confirmation required)", style="dim")
+        if not self.ui_renderer.confirm_history_clear(len(deletable_ids)):
+            self.ui_renderer.print("Operation cancelled", style="dim")
+            return
+        
+        deleted = 0
+        failed = 0
+        for session_id in deletable_ids:
+            resp = self.client.request("session.delete", {"session_id": session_id})
+            if resp.get("success"):
+                deleted += 1
+            else:
+                failed += 1
+        
+        if deleted:
+            self.ui_renderer.print_success(f"Deleted {deleted} session(s)")
+        if failed:
+            self.ui_renderer.print_warning(f"Failed to delete {failed} session(s)")
     
     def _cmd_debug(self, args: str) -> bool:
         """Handle /debug command."""
-        import argparse
-        
         parser = argparse.ArgumentParser(prog="/debug", add_help=False)
         parser.add_argument("action", nargs="?", default="status", help="Action: on, off, status, list, clean")
         
-        try:
-            parsed = parser.parse_args(args.split() if args else [])
-        except SystemExit:
+        parsed = self._parse_args(parser, args)
+        if parsed is None:
             return True
         
         action = parsed.action.lower()
         
         if action == "on":
-            self.debug_logger.enable()
-            self.config_manager.config.debug_mode = True
-            self.ui_renderer.print_success("Debug mode enabled")
-            self.ui_renderer.print(f"Logs will be saved to: {self.debug_logger.debug_dir}", style="dim")
-            
-            # Start debug session if there's an active session
-            if self.session_manager.has_session:
-                session = self.session_manager.current_session
-                self.debug_logger.start_session(
-                    self.executor.state.current_agent,
-                    session.session_id if session else None
-                )
+            response = self.client.request("debug.set", {"enabled": True})
+            if response.get("success"):
+                self.ui_renderer.print_success("Debug mode enabled")
+                debug_dir = response.get("payload", {}).get("debug_dir")
+                if debug_dir:
+                    self.ui_renderer.print(f"Logs will be saved to: {debug_dir}", style="dim")
+            else:
+                self.ui_renderer.print_error("Failed to enable debug mode")
         
         elif action == "off":
-            # End current debug session
-            log_path = self.debug_logger.end_session()
-            if log_path:
-                self.ui_renderer.print(f"Debug log saved: {log_path}", style="dim")
-            
-            self.debug_logger.disable()
-            self.config_manager.config.debug_mode = False
-            self.ui_renderer.print("Debug mode disabled", style="dim")
+            response = self.client.request("debug.set", {"enabled": False})
+            if response.get("success"):
+                self.ui_renderer.print("Debug mode disabled", style="dim")
+                last_log = response.get("payload", {}).get("last_log")
+                if last_log:
+                    self.ui_renderer.print(f"Debug log saved: {last_log}", style="dim")
+            else:
+                self.ui_renderer.print_error("Failed to disable debug mode")
         
         elif action == "status":
-            status = self.debug_logger.get_status()
+            response = self.client.request("debug.status", {})
+            status = response.get("payload", {}) if response.get("success") else {}
             self.ui_renderer.print()
             self.ui_renderer.print("[bold]Debug Status[/bold]")
-            self.ui_renderer.print(f"  Enabled: {'[green]Yes[/green]' if status['enabled'] else '[dim]No[/dim]'}")
-            self.ui_renderer.print(f"  Log directory: {status['debug_dir']}")
-            self.ui_renderer.print(f"  Log count: {status['log_count']}")
-            if status['current_log']:
-                self.ui_renderer.print(f"  Current log: {status['current_log']}")
+            enabled = bool(status.get("enabled", False))
+            self.ui_renderer.print(f"  Enabled: {'[green]Yes[/green]' if enabled else '[dim]No[/dim]'}")
+            self.ui_renderer.print(f"  Log directory: {status.get('debug_dir', 'N/A')}")
+            self.ui_renderer.print(f"  Log count: {status.get('log_count', 0)}")
+            if status.get("current_log"):
+                self.ui_renderer.print(f"  Current log: {status.get('current_log')}")
         
         elif action == "list":
-            logs = self.debug_logger.list_logs()
+            response = self.client.request("debug.list", {})
+            logs = response.get("payload", {}).get("logs", []) if response.get("success") else []
             if not logs:
                 self.ui_renderer.print("No debug logs found", style="dim")
                 return True
@@ -844,7 +704,8 @@ class CommandHandler:
                 self.ui_renderer.print(f"    [dim]Messages: {log['message_count']}, Tools: {log['tool_call_count']}[/dim]")
         
         elif action == "clean":
-            removed = self.debug_logger.cleanup_old_logs(days=7)
+            response = self.client.request("debug.clean", {"days": 7})
+            removed = response.get("payload", {}).get("removed", 0) if response.get("success") else 0
             self.ui_renderer.print_success(f"Removed {removed} old debug log(s)")
         
         else:
@@ -855,25 +716,19 @@ class CommandHandler:
     
     def _cmd_compact(self, args: str) -> bool:
         """Handle /compact command."""
-        import argparse
-        
         parser = argparse.ArgumentParser(prog="/compact", add_help=False)
         parser.add_argument("--soft", action="store_true", help="Soft compaction only (clear tool results)")
         parser.add_argument("--hard", action="store_true", help="Hard compaction (restructure conversation)")
         parser.add_argument("--status", action="store_true", help="Show compaction status only")
         
-        try:
-            parsed = parser.parse_args(args.split() if args else [])
-        except SystemExit:
-            return True
-        
-        if not self.executor:
-            self.ui_renderer.print_error("Executor not initialized")
+        parsed = self._parse_args(parser, args)
+        if parsed is None:
             return True
         
         # Show status only
         if parsed.status:
-            usage = self.executor.get_token_usage()
+            response = self.client.request("context.status", {})
+            usage = response.get("payload", {}) if response.get("success") else {}
             self.ui_renderer.print()
             self.ui_renderer.print("[bold]Context Status[/bold]")
             self.ui_renderer.print(f"  Current tokens: {usage.get('current_tokens', 0):,}")
@@ -903,7 +758,10 @@ class CommandHandler:
         else:
             self.ui_renderer.print("[dim]Compacting context (auto mode)...[/dim]")
         
-        result = self.executor.compact_context(force=force_hard, force_soft=force_soft)
+        result = self.client.request(
+            "context.compact",
+            {"force": force_hard, "force_soft": force_soft},
+        ).get("payload", {})
         
         if result.get("success"):
             compaction_type = result.get('compaction_type', 'none')
@@ -936,24 +794,18 @@ class CommandHandler:
     
     def _cmd_context(self, args: str) -> bool:
         """Handle /context command."""
-        import argparse
-        
         parser = argparse.ArgumentParser(prog="/context", add_help=False)
         parser.add_argument("action", nargs="?", default="status", help="Action: status, stats, clear")
         
-        try:
-            parsed = parser.parse_args(args.split() if args else [])
-        except SystemExit:
+        parsed = self._parse_args(parser, args)
+        if parsed is None:
             return True
         
         action = parsed.action.lower()
         
         if action == "status":
-            if not self.executor:
-                self.ui_renderer.print_error("Executor not initialized")
-                return True
-            
-            usage = self.executor.get_token_usage()
+            response = self.client.request("context.status", {})
+            usage = response.get("payload", {}) if response.get("success") else {}
             self.ui_renderer.print()
             self.ui_renderer.print("[bold]Context Information[/bold]")
             self.ui_renderer.print(f"  Current tokens: {usage.get('current_tokens', 0):,}")
@@ -977,7 +829,7 @@ class CommandHandler:
             self.ui_renderer.print(f"  [{bar_color}]{bar}[/{bar_color}] {percentage}%")
             
             # Messages count
-            msg_count = len(self.executor.state.messages) if self.executor else 0
+            msg_count = usage.get("message_count", 0)
             self.ui_renderer.print(f"  Messages: {msg_count}")
             
             # Warning if approaching limit
@@ -988,9 +840,9 @@ class CommandHandler:
         
         elif action == "stats":
             # Show cache stats
-            cache = self.executor.response_cache if self.executor else None
-            if cache:
-                stats = cache.get_stats()
+            response = self.client.request("context.cache.stats", {})
+            if response.get("success"):
+                stats = response.get("payload", {})
                 self.ui_renderer.print()
                 self.ui_renderer.print("[bold]Cache Statistics[/bold]")
                 self.ui_renderer.print(f"  Entries: {stats['entries']}/{stats['max_entries']}")
@@ -1001,9 +853,8 @@ class CommandHandler:
         
         elif action == "clear":
             # Clear cache
-            cache = self.executor.response_cache if self.executor else None
-            if cache:
-                cache.clear()
+            response = self.client.request("context.cache.clear", {})
+            if response.get("success"):
                 self.ui_renderer.print_success("Cache cleared")
             else:
                 self.ui_renderer.print("Cache not initialized", style="dim")
@@ -1016,31 +867,20 @@ class CommandHandler:
     
     def _cmd_permission(self, args: str) -> bool:
         """Handle /permission command."""
-        import argparse
-        
         parser = argparse.ArgumentParser(prog="/permission", add_help=False)
         parser.add_argument("action", nargs="?", default="status", help="Action: status, grant, revoke, clear")
         parser.add_argument("type", nargs="?", default="", help="Permission type: write, edit, bash, bash_delete")
         
-        try:
-            parsed = parser.parse_args(args.split() if args else [])
-        except SystemExit:
+        parsed = self._parse_args(parser, args)
+        if parsed is None:
             return True
-        
-        # Get permission manager
-        from backend.permission import get_permission_manager, PermissionType
-        perm_manager = get_permission_manager()
         
         action = parsed.action.lower()
         
         if action == "status":
             # Show current permission status
-            permissions = perm_manager.get_session_permissions()
-            
-            # Convert to display format
-            display_perms = {}
-            for perm_type, granted in permissions.items():
-                display_perms[perm_type.value] = granted
+            response = self.client.request("permission.status", {})
+            display_perms = response.get("payload", {}).get("permissions", {})
             
             # Show in UI
             self.ui_renderer.show_permission_status(display_perms)
@@ -1051,12 +891,10 @@ class CommandHandler:
                 self.ui_renderer.print("Usage: /permission grant <write|edit|bash|bash_delete>", style="dim")
                 return True
             
-            # Parse permission type
-            try:
-                perm_type = PermissionType(parsed.type.lower())
-                perm_manager.grant_session_permission(perm_type)
+            response = self.client.request("permission.grant", {"type": parsed.type.lower()})
+            if response.get("success"):
                 self.ui_renderer.print_success(f"Granted session permission: {parsed.type}")
-            except ValueError:
+            else:
                 self.ui_renderer.print_error(f"Invalid permission type: {parsed.type}")
                 self.ui_renderer.print("Available types: write, edit, bash, bash_delete", style="dim")
         
@@ -1066,97 +904,26 @@ class CommandHandler:
                 self.ui_renderer.print("Usage: /permission revoke <write|edit|bash|bash_delete>", style="dim")
                 return True
             
-            # Parse permission type
-            try:
-                perm_type = PermissionType(parsed.type.lower())
-                perm_manager.revoke_session_permission(perm_type)
+            response = self.client.request("permission.revoke", {"type": parsed.type.lower()})
+            if response.get("success"):
                 self.ui_renderer.print(f"[dim]Revoked session permission: {parsed.type}[/dim]")
-            except ValueError:
+            else:
                 self.ui_renderer.print_error(f"Invalid permission type: {parsed.type}")
                 self.ui_renderer.print("Available types: write, edit, bash, bash_delete", style="dim")
         
         elif action == "clear":
             # Clear all session permissions
-            perm_manager.clear_session_permissions()
-            self.ui_renderer.print_success("Cleared all session permissions")
+            response = self.client.request("permission.clear", {})
+            if response.get("success"):
+                self.ui_renderer.print_success("Cleared all session permissions")
+            else:
+                self.ui_renderer.print_error("Failed to clear permissions")
         
         else:
             self.ui_renderer.print_error(f"Unknown action: {action}")
             self.ui_renderer.print("Usage: /permission status | grant <type> | revoke <type> | clear", style="dim")
         
         return True
-    
-    def _register_mcp_tools(self, mcp_manager) -> None:
-        """
-        Register MCP tools to the tool registry.
-        
-        Args:
-            mcp_manager: MCP manager instance with connected servers
-        """
-        if not self.executor or not self.executor.tool_registry:
-            return
-        
-        # Create MCP tool wrappers
-        mcp_tools = create_mcp_tools(mcp_manager)
-        
-        # Register each MCP tool to the tool registry
-        registered_count = 0
-        for tool in mcp_tools:
-            # Unregister existing tool with same name if exists (for reconnection)
-            if self.executor.tool_registry.get(tool.name):
-                self.executor.tool_registry.unregister(tool.name)
-            self.executor.tool_registry.register(tool)
-            registered_count += 1
-        
-        if registered_count > 0:
-            self.ui_renderer.print(f"[dim]Registered {registered_count} MCP tool(s)[/dim]")
-    
-    def _unregister_mcp_tools(self, mcp_manager, server_name: str = None) -> None:
-        """
-        Unregister MCP tools from the tool registry.
-        
-        Args:
-            mcp_manager: MCP manager instance
-            server_name: Optional specific server name to unregister tools for.
-                        If None, unregisters all MCP tools.
-        """
-        if not self.executor or not self.executor.tool_registry:
-            return
-        
-        unregistered_count = 0
-        
-        if server_name:
-            # Unregister tools for specific server
-            # Individual tools are named: mcp_{server_name}_{tool_name}
-            prefix = f"mcp_{server_name}_"
-            tools_to_remove = []
-            
-            for tool_name in list(self.executor.tool_registry.tools.keys()):
-                if tool_name.startswith(prefix):
-                    tools_to_remove.append(tool_name)
-            
-            for tool_name in tools_to_remove:
-                if self.executor.tool_registry.unregister(tool_name):
-                    unregistered_count += 1
-        else:
-            # Unregister all MCP tools
-            # Remove the generic mcp_tool wrapper
-            if self.executor.tool_registry.get("mcp_tool"):
-                if self.executor.tool_registry.unregister("mcp_tool"):
-                    unregistered_count += 1
-            
-            # Remove all individual MCP tools (those starting with "mcp_")
-            tools_to_remove = []
-            for tool_name in list(self.executor.tool_registry.tools.keys()):
-                if tool_name.startswith("mcp_"):
-                    tools_to_remove.append(tool_name)
-            
-            for tool_name in tools_to_remove:
-                if self.executor.tool_registry.unregister(tool_name):
-                    unregistered_count += 1
-        
-        if unregistered_count > 0:
-            self.ui_renderer.print(f"[dim]Unregistered {unregistered_count} MCP tool(s)[/dim]")
     
     def _cmd_exit(self, args: str) -> bool:
         """Handle /exit command."""

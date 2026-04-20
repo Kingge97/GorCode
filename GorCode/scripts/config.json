@@ -1,0 +1,36 @@
+{
+  "model_connections": {
+    "main": {
+      "name":"main",
+      "base_url": "",
+      "api_key": "",
+      "model_name": "",
+      "router": "",
+      "stream": true,
+      "extra_args": {}
+    },
+    "mini": {
+      "name":"mini",
+      "base_url": "",
+      "api_key": "",
+      "model_name": "",
+      "router": "",
+      "stream": true,
+      "extra_args": {}
+    }
+  },
+  "default_agent": "build",
+  "agent_model_mapping": {
+    "build": "main",
+    "plan": "main",
+    "glawd":"main",
+    "godex":"main",
+    "explore": "mini",
+    "general": "mini",
+    "compaction": "main"
+  },
+  "default_encoding": "utf-8",
+  "debug_mode": false,
+  "max_context_length": 128000,
+  "mcp_servers": {}
+}

@@ -9,7 +9,9 @@ import json
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
+
+from ..utils.serialization import dataclass_from_dict, dataclass_to_dict
 import copy
 
 
@@ -27,27 +29,20 @@ class ModelConnection:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
-        return {
-            "name": self.name,
-            "base_url": self.base_url,
-            "api_key": self.api_key,
-            "model_name": self.model_name,
-            "router": self.router,
-            "stream": self.stream,
-            "extra_args": self.extra_args,
-        }
+        return dataclass_to_dict(self)
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ModelConnection":
         """Create from dictionary."""
-        return cls(
-            name=data.get("name", "default"),
-            base_url=data.get("base_url", ""),
-            api_key=data.get("api_key", ""),
-            model_name=data.get("model_name", ""),
-            router=data.get("router", "openai-chat"),
-            stream=data.get("stream", True),
-            extra_args=data.get("extra_args", {}),
+        return dataclass_from_dict(
+            cls,
+            data,
+            field_defaults={
+                "name": "default",
+                "base_url": "",
+                "api_key": "",
+                "model_name": "",
+            },
         )
 
 
@@ -76,46 +71,45 @@ class GorCodeConfig:
     
     # MCP settings
     mcp_servers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+    # File tool settings (optional overrides)
+    file_tool_settings: Dict[str, Any] = field(default_factory=dict)
+
+    # Permission settings (optional overrides)
+    permission_settings: Dict[str, Any] = field(default_factory=dict)
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
-        return {
-            "model_connections": {
-                name: conn.to_dict() 
-                for name, conn in self.model_connections.items()
+        return dataclass_to_dict(
+            self,
+            field_serializers={
+                "model_connections": lambda value: {
+                    name: conn.to_dict() for name, conn in (value or {}).items()
+                },
             },
-            "default_agent": self.default_agent,
-            "agent_model_mapping": self.agent_model_mapping,
-            "default_encoding": self.default_encoding,
-            "debug_mode": self.debug_mode,
-            "max_context_length": self.max_context_length,
-            "permission_diff_max_lines": self.permission_diff_max_lines,
-            "permission_diff_page_lines": self.permission_diff_page_lines,
-            "mcp_servers": self.mcp_servers,
-        }
+        )
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "GorCodeConfig":
         """Create from dictionary."""
-        config = cls()
-        
-        if "model_connections" in data:
-            config.model_connections = {
-                name: ModelConnection.from_dict(conn)
-                for name, conn in data["model_connections"].items()
-            }
-        
-        config.default_agent = data.get("default_agent", "build")
-        config.agent_model_mapping = data.get("agent_model_mapping", config.agent_model_mapping)
-        config.default_encoding = data.get("default_encoding", "utf-8")
-        config.debug_mode = data.get("debug_mode", False)
-        config.max_context_length = data.get("max_context_length", 128000)
-        config.permission_diff_max_lines = data.get("permission_diff_max_lines", 100)
-        config.permission_diff_page_lines = data.get("permission_diff_page_lines", 100)
-        # Support both "mcp_servers" (GorCode native) and "mcpServers" (Claude Code compatible)
-        config.mcp_servers = data.get("mcp_servers", {}) or data.get("mcpServers", {})
-        
-        return config
+        payload = dict(data or {})
+        if not payload.get("mcp_servers") and payload.get("mcpServers"):
+            payload["mcp_servers"] = payload.get("mcpServers")
+        if not payload.get("file_tool_settings") and payload.get("fileToolSettings"):
+            payload["file_tool_settings"] = payload.get("fileToolSettings")
+        if not payload.get("permission_settings") and payload.get("permissionSettings"):
+            payload["permission_settings"] = payload.get("permissionSettings")
+
+        return dataclass_from_dict(
+            cls,
+            payload,
+            field_deserializers={
+                "model_connections": lambda value: {
+                    name: ModelConnection.from_dict(conn)
+                    for name, conn in (value or {}).items()
+                }
+            },
+        )
 
 
 class ConfigManager:
@@ -146,6 +140,47 @@ class ConfigManager:
         self._user_config: Optional[GorCodeConfig] = None
         self._project_config: Optional[GorCodeConfig] = None
         self._merged_config: Optional[GorCodeConfig] = None
+
+    @staticmethod
+    def build_default_user_config() -> GorCodeConfig:
+        """Build default user configuration."""
+        config = GorCodeConfig()
+        config.model_connections = {
+            "main": ModelConnection(
+                name="main",
+                base_url="https://api.openai.com/v1",
+                api_key="YOUR_API_KEY_HERE",
+                model_name="gpt-4",
+                router="openai-chat",
+                stream=True,
+            ),
+            "mini": ModelConnection(
+                name="mini",
+                base_url="https://api.openai.com/v1",
+                api_key="YOUR_API_KEY_HERE",
+                model_name="gpt-3.5-turbo",
+                router="openai-chat",
+                stream=True,
+            ),
+        }
+
+        config.agent_model_mapping = {
+            "build": "main",
+            "plan": "main",
+            "explore": "mini",
+            "general": "mini",
+            "compaction": "mini",
+        }
+
+        return config
+
+    @staticmethod
+    def build_default_project_config() -> GorCodeConfig:
+        """Build default project configuration (minimal, inherits from user config)."""
+        config = GorCodeConfig()
+        config.model_connections = {}
+        config.default_agent = "build"
+        return config
     
     def get_user_config_dir(self) -> Path:
         """Get user configuration directory."""
@@ -249,7 +284,15 @@ class ConfigManager:
             if result.mcp_servers is None:
                 result.mcp_servers = {}
             result.mcp_servers.update(override.mcp_servers)
-        
+        if override.file_tool_settings:
+            if result.file_tool_settings is None:
+                result.file_tool_settings = {}
+            result.file_tool_settings.update(override.file_tool_settings)
+        if override.permission_settings:
+            if result.permission_settings is None:
+                result.permission_settings = {}
+            result.permission_settings.update(override.permission_settings)
+
         return result
     
     def save_user_config(self, config: GorCodeConfig) -> bool:
@@ -277,26 +320,8 @@ class ConfigManager:
         """Initialize user configuration directory with default config."""
         config_dir = self.get_user_config_dir()
         config_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Create default config with placeholder model connections
-        default_config = GorCodeConfig()
-        default_config.model_connections = {
-            "main": ModelConnection(
-                name="main",
-                base_url="https://api.openai.com/v1",
-                api_key="YOUR_API_KEY_HERE",
-                model_name="gpt-4",
-                router="openai-chat",
-            ),
-            "mini": ModelConnection(
-                name="mini",
-                base_url="https://api.openai.com/v1",
-                api_key="YOUR_API_KEY_HERE",
-                model_name="gpt-3.5-turbo",
-                router="openai-chat",
-            ),
-        }
-        
+
+        default_config = self.build_default_user_config()
         return self.save_user_config(default_config)
     
     def initialize_project_config(self) -> bool:
@@ -307,8 +332,7 @@ class ConfigManager:
         (config_dir / "agents").mkdir(parents=True, exist_ok=True)
         (config_dir / "skills").mkdir(parents=True, exist_ok=True)
         
-        # Create project-level config (minimal, inherits from user config)
-        project_config = GorCodeConfig()
+        project_config = self.build_default_project_config()
         return self.save_project_config(project_config)
     
     @property

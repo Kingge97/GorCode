@@ -4,11 +4,29 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 LAUNCHER="$REPO_ROOT/run_gorcode.py"
+GORCONFIG_CREATE="$SCRIPT_DIR/gorconfig_create.py"
+RG_DOWNLOAD="$SCRIPT_DIR/rg_download.py"
 
 if [[ ! -f "$LAUNCHER" ]]; then
   echo "Launcher not found: $LAUNCHER" >&2
   exit 1
 fi
+
+if [[ ! -f "$GORCONFIG_CREATE" ]]; then
+  echo "Script not found: $GORCONFIG_CREATE" >&2
+  exit 1
+fi
+
+if [[ ! -f "$RG_DOWNLOAD" ]]; then
+  echo "Script not found: $RG_DOWNLOAD" >&2
+  exit 1
+fi
+
+echo "Creating default ~/.gorcode configuration..."
+python3 "$GORCONFIG_CREATE"
+
+echo "Downloading ripgrep into ~/.gorcode/gorpath/path..."
+python3 "$RG_DOWNLOAD"
 
 BIN_DIR="$HOME/.local/bin"
 mkdir -p "$BIN_DIR"

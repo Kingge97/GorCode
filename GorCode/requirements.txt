@@ -16,6 +16,9 @@ pydantic>=2.0.0
 # Configuration
 pyyaml>=6.0.0
 
+# File parsing
+pypdf>=4.0.0
+
 # Development dependencies (install with pip install -r requirements-dev.txt)
 # pytest>=7.0.0
 # pytest-cov>=4.0.0

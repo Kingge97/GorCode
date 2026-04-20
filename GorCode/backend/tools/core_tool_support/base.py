@@ -10,6 +10,9 @@ from typing import Any, Dict, List, Optional, Callable
 from dataclasses import dataclass, field
 import json
 
+from .tool_utils import tool_error_result
+from ...utils.serialization import dataclass_to_dict
+
 
 @dataclass
 class ToolResult:
@@ -37,11 +40,7 @@ class ToolDefinition:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to OpenAI tool format."""
-        return {
-            "name": self.name,
-            "description": self.description,
-            "parameters": self.parameters,
-        }
+        return dataclass_to_dict(self, exclude_fields={"category"})
 
 
 class BaseTool(ABC):
@@ -95,6 +94,24 @@ class BaseTool(ABC):
         pass
     
     @abstractmethod
+    def get_parameters(self) -> Dict[str, Any]:
+        """
+        Get tool parameter schema for model API.
+        
+        Returns:
+            JSON schema dict for tool parameters
+        """
+        pass
+
+    def get_description(self) -> str:
+        """
+        Get tool description for model API.
+        
+        Returns:
+            Description string
+        """
+        return self.description
+
     def get_definition(self) -> ToolDefinition:
         """
         Get tool definition for model API.
@@ -102,7 +119,12 @@ class BaseTool(ABC):
         Returns:
             ToolDefinition object
         """
-        pass
+        return ToolDefinition(
+            name=self.name,
+            description=self.get_description(),
+            parameters=self.get_parameters(),
+            category=self.category,
+        )
     
     def validate_args(self, **kwargs) -> bool:
         """
@@ -264,11 +286,7 @@ class ToolRegistry:
             
             return tool.execute(**kwargs)
         except Exception as e:
-            return ToolResult(
-                success=False,
-                output="",
-                error=str(e)
-            )
+            return tool_error_result(e)
     
     @property
     def tools(self) -> Dict[str, BaseTool]:

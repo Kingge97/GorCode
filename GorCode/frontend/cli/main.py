@@ -5,9 +5,6 @@ CLI Main Entry
 Main entry point for GorCode CLI using Click.
 """
 
-import sys
-import os
-import json
 from pathlib import Path
 from typing import Optional
 
@@ -19,18 +16,12 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 
-# Add repo root and GorCode dir to path for imports
-_repo_root = Path(__file__).resolve().parent.parent.parent.parent
-_gorcode_dir = _repo_root / "GorCode"
-for _p in (str(_repo_root), str(_gorcode_dir)):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+from types import SimpleNamespace
 
-from backend.core.events import EventBus, Event, EventType
-from backend.core.executor import BackendExecutor
-from backend.config.manager import ConfigManager, GorCodeConfig
-from frontend.ui.renderer import UIRenderer
-from frontend.commands.handler import CommandHandler
+from GorCode.frontend.ui.renderer import UIRenderer
+from GorCode.frontend.ui.init_render import render_init_result
+from GorCode.frontend.commands.handler import CommandHandler
+from GorCode.bridge.inprocess import FrontendClient, create_inprocess_client
 
 
 # Create console instance
@@ -81,51 +72,84 @@ def print_goodbye():
     console.print()
 
 
-def _has_valid_model_connections(config: GorCodeConfig) -> bool:
+def _get_current_agent(client: FrontendClient) -> str:
+    """Get current agent name for prompt display."""
+    resp = client.request("session.status")
+    if resp.get("success"):
+        return resp.get("payload", {}).get("agent") or "build"
+    return "build"
+
+
+def _has_valid_model_connections(config: dict) -> bool:
     """Check if config contains at least one usable model connection."""
-    if not config.model_connections:
+    model_connections = config.get("model_connections") if isinstance(config, dict) else None
+    if not model_connections:
         return False
-    for conn in config.model_connections.values():
-        if not conn:
+    for conn in model_connections.values():
+        if not isinstance(conn, dict):
             continue
-        api_key = (conn.api_key or "").strip()
-        base_url = (conn.base_url or "").strip()
-        model_name = (conn.model_name or "").strip()
+        api_key = (conn.get("api_key") or "").strip()
+        base_url = (conn.get("base_url") or "").strip()
+        model_name = (conn.get("model_name") or "").strip()
         if api_key and api_key != "YOUR_API_KEY_HERE" and base_url and model_name:
             return True
     return False
 
 
-def _ensure_user_config_ready(config_manager: ConfigManager) -> bool:
+def _ensure_user_config_ready(client: FrontendClient) -> bool:
     """Ensure user config exists and has usable connections before startup."""
-    user_config_path = config_manager.get_user_config_path()
-    if not user_config_path.exists():
+    status = client.request("config.status")
+    if not status.get("success"):
+        console.print("[red]Failed to read configuration status.[/red]")
+        return False
+
+    payload = status.get("payload", {})
+    user_exists = payload.get("user_exists", False)
+    user_path = payload.get("paths", {}).get("user", "~/.gorcode/config.json")
+
+    if not user_exists:
         console.print("[yellow]User config not found. Creating default config...[/yellow]")
-        created = config_manager.initialize_user_config()
-        if not created:
+        created = client.request("config.initialize", {"user_only": True, "force": False})
+        result = created.get("payload", {}).get("result", {}) if created.get("success") else {}
+        if not created.get("success") or not result.get("success"):
             console.print("[red]Failed to create default user config:[/red]")
-            console.print(f"[dim]{user_config_path}[/dim]")
+            console.print(f"[dim]{user_path}[/dim]")
             console.print("[dim]Please create and configure it, then restart GorCode.[/dim]")
             return False
         console.print("[green]Default user config created:[/green]")
-        console.print(f"[dim]{user_config_path}[/dim]")
+        console.print(f"[dim]{user_path}[/dim]")
         console.print("[dim]Please configure your connections and restart GorCode.[/dim]")
         return False
-    try:
-        with open(user_config_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        user_config = GorCodeConfig.from_dict(data)
-    except (json.JSONDecodeError, OSError) as e:
+
+    user_config_resp = client.request("config.get", {"scope": "user"})
+    if not user_config_resp.get("success"):
         console.print("[red]Failed to read user config:[/red]")
-        console.print(f"[dim]{user_config_path}[/dim]")
-        console.print(f"[dim]Error: {e}[/dim]")
+        console.print(f"[dim]{user_path}[/dim]")
+        console.print(f"[dim]Error: {user_config_resp.get('error', 'unknown')}[/dim]")
         console.print("[dim]Please fix the config and restart GorCode.[/dim]")
         return False
-    if not _has_valid_model_connections(user_config):
+
+    merged_resp = client.request("config.get", {"scope": "merged"})
+    merged_config = merged_resp.get("payload", {}).get("config", {}) if merged_resp.get("success") else {}
+    if not _has_valid_model_connections(merged_config):
         console.print("[yellow]No usable model connections found[/yellow]")
-        console.print(f"[dim]Please configure at least one connection in {user_config_path} and restart GorCode.[/dim]")
+        console.print(f"[dim]Please configure at least one connection in {user_path} and restart GorCode.[/dim]")
         return False
+
     return True
+
+
+def _connect_first_model_or_warn(config: dict, client: FrontendClient) -> None:
+    """Connect to the first configured model, or warn if unavailable."""
+    model_connections = config.get("model_connections") if isinstance(config, dict) else None
+    if model_connections:
+        first_model = list(model_connections.keys())[0]
+        if not client.request("model.switch", {"model": first_model}).get("success"):
+            console.print(f"[yellow]Warning: Failed to connect to model '{first_model}'[/yellow]")
+            console.print("[dim]Check your API key and base_url in ~/.gorcode/config.json[/dim]")
+    else:
+        console.print("[yellow]Warning: No model connections configured[/yellow]")
+        console.print("[dim]Please configure models in ~/.gorcode/config.json[/dim]")
 
 
 @click.group(invoke_without_command=True)
@@ -210,51 +234,23 @@ def run(
     permission: str,
 ):
     """Run GorCode in interactive mode."""
-    config_manager = ConfigManager(config_path=config_path)
-    if not _ensure_user_config_ready(config_manager):
+    runtime = create_inprocess_client(config_path=config_path)
+    client = runtime.client
+
+    if not _ensure_user_config_ready(client):
         return
     print_welcome()
     
     # Initialize components
-    event_bus = EventBus()
-    executor = BackendExecutor(event_bus)
-    
-    # 订阅 EventBus 事件，让渲染器能接收子代理等事件
-    # 子代理的事件通过 EventBus 发送，主代理的事件通过 yield 返回
-    def setup_event_subscriptions():
-        """Setup event subscriptions for the renderer."""
-        # 订阅子代理启动/结束事件
-        event_bus.subscribe(EventType.AGENT_SUBAGENT_START, ui_renderer.render_event)
-        event_bus.subscribe(EventType.AGENT_SUBAGENT_END, ui_renderer.render_event)
-        # 订阅子代理的工具事件
-        event_bus.subscribe(EventType.TOOL_EXECUTION_START, ui_renderer.render_event)
-        event_bus.subscribe(EventType.TOOL_RESULT, ui_renderer.render_event)
-        # 订阅子代理的发言事件
-        event_bus.subscribe(EventType.MODEL_ANSWER, ui_renderer.render_event)
-        # 订阅子代理的 UI 消息事件（如压缩提示）
-        event_bus.subscribe(EventType.UI_MESSAGE, ui_renderer.render_event)
-    
-    config = config_manager.load_config()
+    config_resp = client.request("config.get", {"scope": "merged"})
+    config = config_resp.get("payload", {}).get("config", {}) if config_resp.get("success") else {}
     # If --agent not provided, fall back to config default_agent
-    agent = agent or config.default_agent or "build"
+    agent = agent or config.get("default_agent") or "build"
+
     if debug:
-        config.debug_mode = True
+        client.request("debug.set", {"enabled": True})
     
-    ui_renderer = UIRenderer(console, config)
-    setup_event_subscriptions()
-    
-    # Initialize executor with components
-    from backend.tools import initialize_tools
-    from backend.agents.base import AgentRegistry
-    
-    tool_registry = initialize_tools(config.default_encoding)
-    agent_registry = AgentRegistry()
-    
-    executor.initialize(
-        config_manager=config_manager,
-        tool_registry=tool_registry,
-        agent_registry=agent_registry,
-    )
+    ui_renderer = UIRenderer(console, SimpleNamespace(**config))
     
     # Set permission callback for UI interaction
     def permission_callback(permission_type: str, metadata: dict) -> tuple:
@@ -272,20 +268,17 @@ def run(
         """
         return ui_renderer.show_permission_dialog(permission_type, metadata)
     
-    executor.set_permission_callback(permission_callback)
+    client.set_permission_callback(permission_callback)
 
     # Apply permission profile (session-level)
     if permission and permission.lower() != "ask":
-        from backend.permission import get_permission_manager, PermissionType
-
-        permission_manager = get_permission_manager()
         permission_value = permission.lower()
         if permission_value in ("all", "exceptrm"):
-            permission_manager.grant_session_permission(PermissionType.WRITE)
-            permission_manager.grant_session_permission(PermissionType.EDIT)
-            permission_manager.grant_session_permission(PermissionType.BASH)
+            client.request("permission.grant", {"type": "write"})
+            client.request("permission.grant", {"type": "edit"})
+            client.request("permission.grant", {"type": "bash"})
             if permission_value == "all":
-                permission_manager.grant_session_permission(PermissionType.BASH_DELETE)
+                client.request("permission.grant", {"type": "bash_delete"})
 
     def reconnect_callback(error_message: str) -> str:
         """
@@ -299,9 +292,13 @@ def run(
         """
         return ui_renderer.show_reconnect_dialog(error_message)
     
-    executor.set_reconnect_callback(reconnect_callback)
-    
-    command_handler = CommandHandler(executor, config_manager, ui_renderer)
+    client.set_reconnect_callback(reconnect_callback)
+
+    # Sync backend debug mode with config
+    if config.get("debug_mode"):
+        client.request("debug.set", {"enabled": True})
+
+    command_handler = CommandHandler(client, ui_renderer)
 
     # Run MCP commands from CLI before prompt/REPL
     if mcps:
@@ -318,37 +315,25 @@ def run(
             command_handler.handle(command)
     
     # Try to switch to default agent (this will use agent_model_mapping to select the correct model)
-    if agent_registry.get(agent):
-        if not executor.switch_agent(agent):
+    agent_exists = client.request("agent.get", {"name": agent}).get("success")
+    if agent_exists:
+        agent_resp = client.request("agent.switch", {"name": agent})
+        if not agent_resp.get("success"):
             # Fallback: if agent switch fails, try to connect to first available model
-            if config.model_connections:
-                first_model = list(config.model_connections.keys())[0]
-                if not executor.switch_model(first_model):
-                    console.print(f"[yellow]Warning: Failed to connect to model '{first_model}'[/yellow]")
-                    console.print("[dim]Check your API key and base_url in ~/.gorcode/config.json[/dim]")
-            else:
-                console.print("[yellow]Warning: No model connections configured[/yellow]")
-                console.print("[dim]Please configure models in ~/.gorcode/config.json[/dim]")
+            _connect_first_model_or_warn(config, client)
     else:
         # Agent not found in registry, fallback to old behavior
-        executor.state.current_agent = agent
-        if config.model_connections:
-            first_model = list(config.model_connections.keys())[0]
-            if not executor.switch_model(first_model):
-                console.print(f"[yellow]Warning: Failed to connect to model '{first_model}'[/yellow]")
-                console.print("[dim]Check your API key and base_url in ~/.gorcode/config.json[/dim]")
-        else:
-            console.print("[yellow]Warning: No model connections configured[/yellow]")
-            console.print("[dim]Please configure models in ~/.gorcode/config.json[/dim]")
+        client.request("agent.set", {"agent": agent})
+        _connect_first_model_or_warn(config, client)
     
     # Override model if explicitly specified
     if model:
-        if not executor.switch_model(model):
+        if not client.request("model.switch", {"model": model}).get("success"):
             console.print(f"[yellow]Warning: Failed to connect to model '{model}'[/yellow]")
 
     # If a prompt is provided, run once and exit (non-interactive)
     if prompt:
-        for event in executor.process_user_input(prompt):
+        for event in client.stream("chat.send", {"text": prompt}):
             ui_renderer.render_event(event)
         print_goodbye()
         return
@@ -368,7 +353,7 @@ def run(
         try:
             # Get user input
             user_input = session.prompt(
-                f"[{executor.state.current_agent}]> ",
+                f"[{_get_current_agent(client)}]> ",
                 multiline=False,
             ).strip()
             
@@ -383,7 +368,7 @@ def run(
                 continue
             
             # Process regular input
-            for event in executor.process_user_input(user_input):
+            for event in client.stream("chat.send", {"text": user_input}):
                 ui_renderer.render_event(event)
             
         except KeyboardInterrupt:
@@ -414,8 +399,6 @@ def run(
 @click.option("--project-only", is_flag=True, help="Initialize project config only")
 def init(path: str, force: bool, user_only: bool, project_only: bool):
     """Initialize GorCode in the current or specified directory."""
-    from backend.config.initializer import ProjectInitializer
-    
     project_path = Path(path).resolve()
     
     console.print()
@@ -423,42 +406,30 @@ def init(path: str, force: bool, user_only: bool, project_only: bool):
     console.print(f"Project path: [cyan]{project_path}[/cyan]")
     console.print()
     
-    initializer = ProjectInitializer(project_path=str(project_path))
-    
+    ui_renderer = UIRenderer(console)
+    runtime = create_inprocess_client()
+    client = runtime.client
+
+    payload = {
+        "path": str(project_path),
+        "force": force,
+        "user_only": user_only,
+        "project_only": project_only,
+    }
+    response = client.request("config.initialize", payload)
+    if not response.get("success"):
+        ui_renderer.print_error(response.get("error") or "Failed to initialize config")
+        return
+
+    data = response.get("payload", {})
     if user_only:
-        result = initializer.initialize_user_config(force=force)
-        if result.success:
-            console.print(f"[green]✓ User configuration: {result.message}[/green]")
-            for p in result.created_paths:
-                console.print(f"  [dim]Created: {p}[/dim]")
-        else:
-            console.print(f"[red]✗ User configuration: {result.message}[/red]")
-            for e in result.errors:
-                console.print(f"  [dim]Error: {e}[/dim]")
-    
+        render_init_result(ui_renderer, "User", data.get("result", {}))
     elif project_only:
-        result = initializer.initialize_project_config(force=force)
-        if result.success:
-            console.print(f"[green]✓ Project configuration: {result.message}[/green]")
-            for p in result.created_paths:
-                console.print(f"  [dim]Created: {p}[/dim]")
-        else:
-            console.print(f"[red]✗ Project configuration: {result.message}[/red]")
-            for e in result.errors:
-                console.print(f"  [dim]Error: {e}[/dim]")
-    
+        render_init_result(ui_renderer, "Project", data.get("result", {}))
     else:
-        results = initializer.initialize_all(force=force)
-        
-        for name, result in [("User", results["user"]), ("Project", results["project"])]:
-            if result.success:
-                console.print(f"[green]✓ {name} configuration: {result.message}[/green]")
-                for p in result.created_paths:
-                    console.print(f"  [dim]Created: {p}[/dim]")
-            else:
-                console.print(f"[red]✗ {name} configuration: {result.message}[/red]")
-                for e in result.errors:
-                    console.print(f"  [dim]Error: {e}[/dim]")
+        results = data.get("results", {})
+        for name, result in [("User", results.get("user", {})), ("Project", results.get("project", {}))]:
+            render_init_result(ui_renderer, name, result)
     
     console.print()
     console.print("[dim]Next steps:[/dim]")
@@ -470,67 +441,72 @@ def init(path: str, force: bool, user_only: bool, project_only: bool):
 @click.option("--config", "-c", type=click.Path(), help="Path to config file")
 def status_cmd(config: Optional[str]):
     """Show configuration and connection status."""
-    config_manager = ConfigManager(config_path=config)
-    
     console.print()
     console.print("[bold]GorCode Status[/bold]")
     console.print()
-    
-    # Configuration info
-    info = config_manager.get_config_info()
-    
+    runtime = create_inprocess_client(config_path=config)
+    client = runtime.client
+
+    status = client.request("config.status")
+    info = status.get("payload", {}) if status.get("success") else {}
+
     console.print("[bold]Configuration:[/bold]")
-    console.print(f"  User config: [cyan]{info['user_config']['path']}[/cyan]")
-    console.print(f"    Exists: [green]Yes[/green]" if info['user_config']['exists'] else "    Exists: [red]No[/red]")
-    
-    console.print(f"  Project config: [cyan]{info['project_config']['path']}[/cyan]")
-    console.print(f"    Exists: [green]Yes[/green]" if info['project_config']['exists'] else "    Exists: [red]No[/red]")
-    
-    if info['custom_config']['path']:
-        console.print(f"  Custom config: [cyan]{info['custom_config']['path']}[/cyan]")
-        console.print(f"    Exists: [green]Yes[/green]" if info['custom_config']['exists'] else "    Exists: [red]No[/red]")
-    
+    user_path = info.get("paths", {}).get("user", "~/.gorcode/config.json")
+    project_path = info.get("paths", {}).get("project", "./.gorcode/config.json")
+    console.print(f"  User config: [cyan]{user_path}[/cyan]")
+    console.print(f"    Exists: [green]Yes[/green]" if info.get("user_exists") else "    Exists: [red]No[/red]")
+
+    console.print(f"  Project config: [cyan]{project_path}[/cyan]")
+    console.print(f"    Exists: [green]Yes[/green]" if info.get("project_exists") else "    Exists: [red]No[/red]")
+
+    custom_path = info.get("paths", {}).get("custom")
+    if custom_path:
+        console.print(f"  Custom config: [cyan]{custom_path}[/cyan]")
+
     console.print()
-    
-    # Model connections
+
+    config_resp = client.request("config.get", {"scope": "merged"})
+    merged = config_resp.get("payload", {}).get("config", {}) if config_resp.get("success") else {}
+
     console.print("[bold]Model Connections:[/bold]")
-    models = config_manager.list_available_models()
+    models = merged.get("model_connections", {})
     if models:
-        for model in models:
-            conn = config_manager.get_model_connection(model)
-            console.print(f"  [cyan]{model}[/cyan]: {conn.model_name} ({conn.router})")
+        for name, conn in models.items():
+            model_name = conn.get("model_name", "unknown") if isinstance(conn, dict) else "unknown"
+            router = conn.get("router", "unknown") if isinstance(conn, dict) else "unknown"
+            console.print(f"  [cyan]{name}[/cyan]: {model_name} ({router})")
     else:
         console.print("  [dim]No model connections configured[/dim]")
-    
+
     console.print()
-    
-    # Agent model mapping
+
     console.print("[bold]Agent Model Mapping:[/bold]")
-    mapping = info['merged_config']['agent_model_mapping']
+    mapping = merged.get("agent_model_mapping", {})
     for agent, model in mapping.items():
         console.print(f"  [cyan]{agent}[/cyan] → [yellow]{model}[/yellow]")
-    
+
     console.print()
 
 
 @cli.command("list-agents")
 def list_agents():
     """List all available agents."""
-    from backend.agents.base import AgentRegistry
-    
-    registry = AgentRegistry()
-    
     console.print("[bold]Available Agents:[/bold]")
     console.print()
-    
-    for agent in registry.get_all_agents():
-        status = "[dim](hidden)[/dim]" if agent.is_hidden else ""
-        default = "[green](default)[/green]" if agent.is_default else ""
-        mode = f"[yellow][{agent.mode.value}][/yellow]"
-        
-        console.print(f"  [cyan]{agent.name}[/cyan] {mode} {default}{status}")
-        if agent.description:
-            console.print(f"    [dim]{agent.description}[/dim]")
+
+    runtime = create_inprocess_client()
+    client = runtime.client
+    response = client.request("agent.list", {"visibility": "all"})
+    agents = response.get("payload", {}).get("agents", []) if response.get("success") else []
+
+    for agent in agents:
+        status = "[dim](hidden)[/dim]" if agent.get("is_hidden") else ""
+        default = "[green](default)[/green]" if agent.get("is_default") else ""
+        mode = f"[yellow][{agent.get('mode', 'unknown')}][/yellow]"
+
+        console.print(f"  [cyan]{agent.get('name', 'unknown')}[/cyan] {mode} {default}{status}")
+        if agent.get("description"):
+            console.print(f"    [dim]{agent.get('description')}[/dim]")
         console.print()
 
 

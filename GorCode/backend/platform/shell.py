@@ -6,8 +6,12 @@ Cross-platform shell command handling utilities.
 """
 
 import os
+import re
 import subprocess
 import shlex
+import threading
+import time
+from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 from .detector import PlatformDetector, PlatformType, ShellType
@@ -218,18 +222,28 @@ class ShellUtils:
             use_shell = False
         
         try:
-            result = subprocess.run(
-                command,
-                shell=use_shell,
-                cwd=cwd,
-                env=run_env,
-                capture_output=capture_output,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
+            if not use_shell or not capture_output:
+                result = subprocess.run(
+                    command,
+                    shell=use_shell,
+                    cwd=cwd,
+                    env=run_env,
+                    capture_output=capture_output,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    timeout=timeout,
+                )
+                return (result.returncode, result.stdout or "", result.stderr or "")
+
+            exec_result = self.execute_with_timeout(
+                command=str(command),
                 timeout=timeout,
+                cwd=cwd,
+                encoding="utf-8",
+                env=run_env,
             )
-            return (result.returncode, result.stdout or "", result.stderr or "")
+            return (exec_result.return_code, exec_result.stdout, exec_result.stderr)
         
         except subprocess.TimeoutExpired:
             return (-1, "", "Command timed out")
@@ -316,6 +330,233 @@ class ShellUtils:
         else:
             return f"export {var_name}={quoted_value}"
 
+    def execute_with_timeout(
+        self,
+        command: str,
+        timeout: Optional[float] = None,
+        cwd: Optional[str] = None,
+        encoding: str = "utf-8",
+        env: Optional[dict] = None,
+    ) -> "ShellExecutionResult":
+        """
+        Execute a command with strict timeout and process cleanup.
+
+        Returns:
+            ShellExecutionResult with stdout/stderr and timeout flag.
+        """
+        process = None
+        try:
+            platform_info = PlatformDetector().detect()
+            shell_cmd = self._build_shell_command(command, platform_info, encoding)
+
+            # Start the process with process group for better control
+            if platform_info.platform_type.value != "windows":
+                process = subprocess.Popen(
+                    shell_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    cwd=cwd,
+                    env=env,
+                    encoding=encoding,
+                    errors="replace",
+                    preexec_fn=os.setsid,
+                )
+            else:
+                process = subprocess.Popen(
+                    shell_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    cwd=cwd,
+                    env=env,
+                    encoding=encoding,
+                    errors="replace",
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                )
+
+            stdout_buffer: List[str] = []
+            stderr_buffer: List[str] = []
+            completed = [False]
+            exception_occurred = [None]
+
+            def read_output() -> None:
+                try:
+                    while True:
+                        ret = process.poll()
+
+                        if platform_info.platform_type.value != "windows":
+                            import select
+                            readable, _, _ = select.select(
+                                [process.stdout, process.stderr], [], [], 0.1
+                            )
+                            if process.stdout in readable:
+                                line = process.stdout.readline()
+                                if line:
+                                    stdout_buffer.append(line)
+                            if process.stderr in readable:
+                                line = process.stderr.readline()
+                                if line:
+                                    stderr_buffer.append(line)
+                        else:
+                            line = process.stdout.readline()
+                            if line:
+                                stdout_buffer.append(line)
+                            line = process.stderr.readline()
+                            if line:
+                                stderr_buffer.append(line)
+
+                        if ret is not None:
+                            remaining_stdout, remaining_stderr = process.communicate()
+                            if remaining_stdout:
+                                stdout_buffer.append(remaining_stdout)
+                            if remaining_stderr:
+                                stderr_buffer.append(remaining_stderr)
+                            completed[0] = True
+                            break
+
+                        time.sleep(0.01)
+                except Exception as e:
+                    exception_occurred[0] = e
+                    completed[0] = True
+
+            output_thread = threading.Thread(target=read_output)
+            output_thread.daemon = True
+            output_thread.start()
+
+            output_thread.join(timeout=timeout)
+
+            if not completed[0]:
+                self._kill_process_tree(process, platform_info)
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+                return ShellExecutionResult(
+                    return_code=-1,
+                    stdout="".join(stdout_buffer),
+                    stderr="".join(stderr_buffer),
+                    timed_out=True,
+                )
+
+            if exception_occurred[0]:
+                raise exception_occurred[0]
+
+            return ShellExecutionResult(
+                return_code=process.returncode,
+                stdout="".join(stdout_buffer),
+                stderr="".join(stderr_buffer),
+                timed_out=False,
+            )
+
+        except Exception as e:
+            if process is not None and process.poll() is None:
+                try:
+                    platform_info = PlatformDetector().detect()
+                    self._kill_process_tree(process, platform_info)
+                except Exception:
+                    pass
+            return ShellExecutionResult(
+                return_code=-1,
+                stdout="",
+                stderr="",
+                timed_out=False,
+                error=str(e),
+            )
+
+    def _build_shell_command(
+        self,
+        command: str,
+        platform_info,
+        encoding: str,
+    ) -> List[str]:
+        """
+        Build the platform-specific shell command list.
+        """
+        code_page = None
+        if platform_info.platform_type.value == "windows":
+            encoding_lower = encoding.lower()
+            code_page_map = {
+                "utf-8": "65001",
+                "utf-8-sig": "65001",
+                "gbk": "936",
+                "gb2312": "936",
+                "gb18030": "54936",
+                "big5": "950",
+                "shift_jis": "932",
+                "euc-jp": "20932",
+                "latin-1": "1252",
+                "cp1252": "1252",
+            }
+            code_page = code_page_map.get(encoding_lower)
+
+        if platform_info.platform_type.value == "windows":
+            if platform_info.shell_type == ShellType.CMD:
+                if code_page:
+                    return ["cmd.exe", "/c", f"chcp {code_page} >nul 2>&1 & {command}"]
+                return ["cmd.exe", "/c", command]
+
+            if platform_info.shell_type == ShellType.POWERSHELL:
+                cmd_specific_patterns = [
+                    r'^\s*cd\s+/d\s+',
+                    r'&&',
+                    r'\|\|',
+                    r'^\s*set\s+\w+=',
+                    r'^\s*echo\s+off',
+                    r'%\w+%',
+                ]
+                is_cmd_syntax = any(
+                    re.search(pattern, command, re.IGNORECASE)
+                    for pattern in cmd_specific_patterns
+                )
+                if is_cmd_syntax:
+                    if code_page:
+                        return ["cmd.exe", "/c", f"chcp {code_page} >nul 2>&1 & {command}"]
+                    return ["cmd.exe", "/c", command]
+
+                if code_page:
+                    ps_command = f"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {command}"
+                    return ["powershell.exe", "-NoProfile", "-Command", ps_command]
+                return ["powershell.exe", "-NoProfile", "-Command", command]
+
+            if code_page:
+                return ["cmd.exe", "/c", f"chcp {code_page} >nul 2>&1 & {command}"]
+            return ["cmd.exe", "/c", command]
+
+        return ["/bin/bash", "-c", command]
+
+    def _kill_process_tree(self, process: subprocess.Popen, platform_info) -> None:
+        """
+        Kill a process and all its children.
+        """
+        try:
+            if platform_info.platform_type.value == "windows":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                    capture_output=True,
+                    timeout=5,
+                )
+            else:
+                import signal
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                time.sleep(0.5)
+                if process.poll() is None:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+
+@dataclass
+class ShellExecutionResult:
+    """Result from executing a shell command."""
+
+    return_code: int
+    stdout: str
+    stderr: str
+    timed_out: bool = False
+    error: Optional[str] = None
+
 
 # Convenience instance
 _shell_utils = ShellUtils()
@@ -336,6 +577,16 @@ def execute_command(
 ) -> Tuple[int, str, str]:
     """Execute a shell command."""
     return _shell_utils.execute(command, cwd, env, True, timeout)
+
+def execute_command_with_timeout(
+    command: str,
+    timeout: Optional[float] = None,
+    cwd: Optional[str] = None,
+    encoding: str = "utf-8",
+    env: Optional[dict] = None,
+) -> ShellExecutionResult:
+    """Execute a shell command with strict timeout handling."""
+    return _shell_utils.execute_with_timeout(command, timeout, cwd, encoding, env)
 
 def find_command(command: str) -> Optional[str]:
     """Find the full path to a command."""

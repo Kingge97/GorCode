@@ -5,7 +5,7 @@ UI Renderer
 Renders UI elements using Rich.
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import json
 from rich.console import Console
 from rich.panel import Panel
@@ -13,13 +13,28 @@ from rich.text import Text
 from rich.table import Table
 from rich.live import Live
 from rich.spinner import Spinner
-from rich.markdown import Markdown
 from rich.syntax import Syntax
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Prompt
 import time
+from GorCode.frontend.commands.registry import COMMAND_SPECS
 
-from backend.core.events import Event, EventType
+LEGACY_EVENT_MAP = {
+    "MODEL_THINKING": "event.model.thinking",
+    "MODEL_ANSWER": "event.model.answer",
+    "MODEL_TOOL_CALL": "event.model.tool_call",
+    "MODEL_END": "event.model.end",
+    "MODEL_ERROR": "event.model.error",
+    "TOOL_EXECUTION_START": "event.tool.start",
+    "TOOL_RESULT": "event.tool.result",
+    "AGENT_SWITCH": "event.agent.switch",
+    "AGENT_SUBAGENT_START": "event.agent.subagent.start",
+    "AGENT_SUBAGENT_END": "event.agent.subagent.end",
+    "UI_MESSAGE": "event.ui.message",
+    "COMMAND_OUTPUT": "event.command.output",
+    "PERMISSION_REQUEST": "event.permission.request",
+    "USER_REJECTION": "event.user.rejection",
+}
 
 
 class UIRenderer:
@@ -66,36 +81,54 @@ class UIRenderer:
         self._agent_run_labels: Dict[str, str] = {}  # run_id -> display label
         self._agent_label_counts: Dict[str, int] = {}  # display_name -> count
     
-    def render_event(self, event: Event) -> None:
+    def render_event(self, event: Any) -> None:
         """
         Render an event.
         
         Args:
             event: Event to render
         """
+        normalized = self._normalize_event(event)
+        event_type = normalized.get("type", "")
+
         handler = {
-            EventType.MODEL_THINKING: self._render_thinking,
-            EventType.MODEL_ANSWER: self._render_answer,
-            EventType.MODEL_TOOL_CALL: self._render_tool_call,
-            EventType.MODEL_END: self._render_end,
-            EventType.MODEL_ERROR: self._render_error,
-            EventType.TOOL_EXECUTION_START: self._render_tool_start,
-            EventType.TOOL_RESULT: self._render_tool_result,
-            EventType.AGENT_SWITCH: self._render_agent_switch,
-            EventType.AGENT_SUBAGENT_START: self._render_subagent_start,
-            EventType.AGENT_SUBAGENT_END: self._render_subagent_end,
-            EventType.UI_MESSAGE: self._render_message,
-            EventType.COMMAND_OUTPUT: self._render_command_output,
-            EventType.PERMISSION_REQUEST: self._render_permission_request,
-            EventType.USER_REJECTION: self._render_user_rejection,
-        }.get(event.event_type)
+            "event.model.thinking": self._render_thinking,
+            "event.model.answer": self._render_answer,
+            "event.model.tool_call": self._render_tool_call,
+            "event.model.end": self._render_end,
+            "event.model.error": self._render_error,
+            "event.tool.start": self._render_tool_start,
+            "event.tool.result": self._render_tool_result,
+            "event.agent.switch": self._render_agent_switch,
+            "event.agent.subagent.start": self._render_subagent_start,
+            "event.agent.subagent.end": self._render_subagent_end,
+            "event.ui.message": self._render_message,
+            "event.command.output": self._render_command_output,
+            "event.permission.request": self._render_permission_request,
+            "event.user.rejection": self._render_user_rejection,
+        }.get(event_type)
         
         if handler:
-            handler(event)
+            handler(normalized)
+
+    def _normalize_event(self, event: Any) -> Dict[str, Any]:
+        """Normalize protocol or legacy events to a protocol-like dict."""
+        if isinstance(event, dict):
+            return event
+
+        event_type = getattr(event, "event_type", None)
+        event_name = getattr(event_type, "name", None) if event_type else None
+        normalized_type = LEGACY_EVENT_MAP.get(event_name or "", "event.unknown")
+        payload = getattr(event, "data", None) or {}
+        return {
+            "type": normalized_type,
+            "payload": payload,
+        }
     
-    def _render_thinking(self, event: Event) -> None:
+    def _render_thinking(self, event: Dict[str, Any]) -> None:
         """Render thinking event."""
-        content = event.data.get("content", "") if event.data else ""
+        payload = event.get("payload") or {}
+        content = payload.get("content", "")
         
         # Only print header once when starting thinking
         if not self._is_thinking:
@@ -107,10 +140,11 @@ class UIRenderer:
         if content:
             self.console.print(content, end="", style="dim italic")
     
-    def _render_answer(self, event: Event) -> None:
+    def _render_answer(self, event: Dict[str, Any]) -> None:
         """Render answer event."""
-        content = event.data.get("content", "") if event.data else ""
-        agent_label, agent_key, indent = self._resolve_agent_display(event.data or {})
+        payload = event.get("payload") or {}
+        content = payload.get("content", "")
+        agent_label, agent_key, indent = self._resolve_agent_display(payload)
         
         # Close thinking section if we were in thinking mode
         if self._is_thinking:
@@ -139,47 +173,15 @@ class UIRenderer:
         if content:
             self.console.print(content, end="")
     
-    def _render_content_with_code(self, content: str) -> None:
-        """Render content that may contain code blocks."""
-        lines = content.split("\n")
-        in_code_block = False
-        code_lines = []
-        language = ""
-        
-        for line in lines:
-            if line.strip().startswith("```"):
-                if in_code_block:
-                    # End code block
-                    code = "\n".join(code_lines)
-                    if code.strip():
-                        try:
-                            syntax = Syntax(code, language or "text", theme="monokai")
-                            self.console.print(syntax)
-                        except Exception:
-                            self.console.print(code)
-                    code_lines = []
-                    in_code_block = False
-                else:
-                    # Start code block
-                    language = line.strip()[3:].strip()
-                    in_code_block = True
-            elif in_code_block:
-                code_lines.append(line)
-            else:
-                self.console.print(line)
-        
-        # Handle unclosed code block
-        if code_lines:
-            self.console.print("\n".join(code_lines))
-    
-    def _render_tool_call(self, event: Event) -> None:
+    def _render_tool_call(self, event: Dict[str, Any]) -> None:
         """Render tool call event."""
-        if not event.data:
+        payload = event.get("payload") or {}
+        if not payload:
             return
         
-        tool_name = event.data.get("name", "unknown")
-        args = event.data.get("arguments", {})
-        agent_name = event.data.get("agent_name", None)
+        tool_name = payload.get("name", "unknown")
+        args = payload.get("arguments", {})
+        agent_name = payload.get("agent_name", None)
         
         # 解析 arguments（可能是 JSON 字符串）
         if isinstance(args, str):
@@ -197,7 +199,7 @@ class UIRenderer:
         # 保存参数供 executing 阶段使用
         self._pending_tool_args = args
     
-    def _render_end(self, event: Event) -> None:
+    def _render_end(self, event: Dict[str, Any]) -> None:
         """Render end event."""
         # Reset state flags
         if self._is_thinking:
@@ -211,25 +213,26 @@ class UIRenderer:
         self.console.print("[dim]─" * 40 + " End " + "─" * 40 + "[/dim]")
         self.console.print()
     
-    def _render_error(self, event: Event) -> None:
+    def _render_error(self, event: Dict[str, Any]) -> None:
         """Render error event."""
         # Reset state flags
         self._is_thinking = False
         self._is_answering = False
         self._current_agent_key = None
-        self._current_agent_key = None
         
-        error = event.data.get("error", "Unknown error") if event.data else "Unknown error"
+        payload = event.get("payload") or {}
+        error = payload.get("error", "Unknown error")
         self.console.print()
         self.console.print(f"[red bold]Error:[/red bold] [red]{error}[/red]")
     
-    def _render_tool_start(self, event: Event) -> None:
+    def _render_tool_start(self, event: Dict[str, Any]) -> None:
         """Render tool execution start event."""
-        if not event.data:
+        payload = event.get("payload") or {}
+        if not payload:
             return
         
-        tool_name = event.data.get("tool_name", "unknown")
-        agent_name = event.data.get("agent_name", None)
+        tool_name = payload.get("tool_name", "unknown")
+        agent_name = payload.get("agent_name", None)
         
         # Task 工具由子代理事件处理，不在这里显示
         if tool_name.lower() in self.SUBAGENT_TOOLS:
@@ -237,11 +240,10 @@ class UIRenderer:
         
         self.console.print()
         # 显示代理名前缀（如果有）
-        if agent_name:
-            self.console.print(f"[bold cyan][{agent_name}][/bold cyan] ", end="")
+        self._print_agent_prefix(agent_name)
         
         # 获取工具参数：优先使用事件中的 args，否则使用保存的参数
-        args = event.data.get("args", None)
+        args = payload.get("args", None)
         if args is None:
             args = getattr(self, '_pending_tool_args', None)
         
@@ -271,16 +273,23 @@ class UIRenderer:
         if len(result) > 300:
             result = result[:300] + "..."
         return result
+
+    def _print_agent_prefix(self, agent_name: Optional[str]) -> None:
+        """Print agent prefix if available."""
+        if not agent_name:
+            return
+        self.console.print(f"[bold cyan][{agent_name}][/bold cyan] ", end="")
     
-    def _render_tool_result(self, event: Event) -> None:
+    def _render_tool_result(self, event: Dict[str, Any]) -> None:
         """Render tool result event."""
-        if not event.data:
+        payload = event.get("payload") or {}
+        if not payload:
             return
         
-        tool_name = event.data.get("tool_name", "unknown")
-        result = event.data.get("result", "")
-        success = event.data.get("success", True)
-        agent_name = event.data.get("agent_name", None)
+        tool_name = payload.get("tool_name", "unknown")
+        result = payload.get("result", "")
+        success = payload.get("success", True)
+        agent_name = payload.get("agent_name", None)
         
         # Task 工具由子代理事件处理，不在这里显示
         if tool_name.lower() in self.SUBAGENT_TOOLS:
@@ -289,8 +298,7 @@ class UIRenderer:
         # 读取类工具：只显示执行状态，不显示结果内容
         if tool_name.lower() in self.READ_ONLY_TOOLS:
             self.console.print()
-            if agent_name:
-                self.console.print(f"[bold cyan][{agent_name}][/bold cyan] ", end="")
+            self._print_agent_prefix(agent_name)
             if success:
                 self.console.print(f"[green]✓[/green] [dim]{tool_name}[/dim] 执行成功")
             else:
@@ -310,8 +318,7 @@ class UIRenderer:
         result_text = Text(result)
         
         self.console.print()
-        if agent_name:
-            self.console.print(f"[bold cyan][{agent_name}][/bold cyan] ", end="")
+        self._print_agent_prefix(agent_name)
         self.console.print("[green]Result:[/green] ", end="")
         self.console.print(result_text)
 
@@ -349,36 +356,24 @@ class UIRenderer:
             return sanitized
         return data
     
-    def _render_agent_switch(self, event: Event) -> None:
+    def _render_agent_switch(self, event: Dict[str, Any]) -> None:
         """Render agent switch event."""
-        if not event.data:
+        payload = event.get("payload") or {}
+        if not payload:
             return
         
-        agent = event.data.get("agent", "unknown")
+        agent = payload.get("agent", "unknown")
         self.console.print()
         self.console.print(f"[cyan]Switched to agent:[/cyan] [bold]{agent}[/bold]")
     
-    def _render_subagent_start(self, event: Event) -> None:
+    def _render_subagent_start(self, event: Dict[str, Any]) -> None:
         """Render subagent start event."""
-        if not event.data:
+        payload = event.get("payload") or {}
+        if not payload:
             return
         
-        agent_name = event.data.get("agent_name", "unknown")
-        description = event.data.get("description", "")
-        parent_agent = event.data.get("parent_agent", "")
-        agent_run_id = event.data.get("agent_run_id")
-        agent_display_name = event.data.get("agent_display_name")
-        
-        # 构建显示名称：如果有父代理，则显示为 "父代理---子代理"
-        if agent_display_name:
-            display_name = agent_display_name
-        elif parent_agent:
-            display_name = f"{parent_agent}---{agent_name}"
-        else:
-            display_name = agent_name
-        
-        agent_label = self._get_agent_label(agent_run_id, display_name)
-        indent = self._get_indent(display_name)
+        description = payload.get("description", "")
+        display_name, agent_label, indent = self._resolve_subagent_display(payload)
         
         self.console.print()
         if indent:
@@ -392,30 +387,20 @@ class UIRenderer:
                 self.console.print(f"[dim]任务: {description}[/dim]")
         
         # 更新当前代理名
+        agent_run_id = payload.get("agent_run_id")
         self._current_agent_key = agent_run_id or display_name
     
-    def _render_subagent_end(self, event: Event) -> None:
+    def _render_subagent_end(self, event: Dict[str, Any]) -> None:
         """Render subagent end event."""
-        if not event.data:
+        payload = event.get("payload") or {}
+        if not payload:
             return
         
-        agent_name = event.data.get("agent_name", "unknown")
-        success = event.data.get("success", True)
-        output = event.data.get("output", "")
-        parent_agent = event.data.get("parent_agent", "")
-        agent_run_id = event.data.get("agent_run_id")
-        agent_display_name = event.data.get("agent_display_name")
+        success = payload.get("success", True)
+        output = payload.get("output", "")
+        agent_run_id = payload.get("agent_run_id")
         
-        # 构建显示名称
-        if agent_display_name:
-            display_name = agent_display_name
-        elif parent_agent:
-            display_name = f"{parent_agent}---{agent_name}"
-        else:
-            display_name = agent_name
-        
-        agent_label = self._get_agent_label(agent_run_id, display_name)
-        indent = self._get_indent(display_name)
+        display_name, agent_label, indent = self._resolve_subagent_display(payload)
         
         self.console.print()
         if success:
@@ -441,6 +426,24 @@ class UIRenderer:
             else:
                 self.console.print(f"[bold cyan][{agent_label}][/bold cyan]")
             self.console.print(output)
+
+    def _resolve_subagent_display(self, payload: Dict[str, Any]) -> tuple:
+        """Resolve display name, label, and indent for a subagent."""
+        agent_name = payload.get("agent_name", "unknown")
+        parent_agent = payload.get("parent_agent", "")
+        agent_run_id = payload.get("agent_run_id")
+        agent_display_name = payload.get("agent_display_name")
+
+        if agent_display_name:
+            display_name = agent_display_name
+        elif parent_agent:
+            display_name = f"{parent_agent}---{agent_name}"
+        else:
+            display_name = agent_name
+
+        agent_label = self._get_agent_label(agent_run_id, display_name)
+        indent = self._get_indent(display_name)
+        return display_name, agent_label, indent
     
     def _get_indent(self, display_name: str) -> str:
         """Get indentation for nested subagent display."""
@@ -476,23 +479,25 @@ class UIRenderer:
         agent_key = run_id or display_name
         return label, agent_key, indent
     
-    def _render_message(self, event: Event) -> None:
+    def _render_message(self, event: Dict[str, Any]) -> None:
         """Render UI message event."""
-        if not event.data:
+        payload = event.get("payload") or {}
+        if not payload:
             return
         
-        message = event.data.get("message", "")
+        message = payload.get("message", "")
         self.console.print(f"[dim]{message}[/dim]")
     
-    def _render_command_output(self, event: Event) -> None:
+    def _render_command_output(self, event: Dict[str, Any]) -> None:
         """Render command output event."""
-        if not event.data:
+        payload = event.get("payload") or {}
+        if not payload:
             return
         
-        output = event.data.get("output", "")
+        output = payload.get("output", "")
         self.console.print(output)
     
-    def _render_permission_request(self, event: Event) -> None:
+    def _render_permission_request(self, event: Dict[str, Any]) -> None:
         """
         Render permission request event.
         
@@ -503,7 +508,7 @@ class UIRenderer:
         # This method exists for completeness but does nothing
         pass
     
-    def _render_user_rejection(self, event: Event) -> None:
+    def _render_user_rejection(self, event: Dict[str, Any]) -> None:
         """
         Render user rejection event (when user rejects operation without reason).
         
@@ -514,7 +519,8 @@ class UIRenderer:
         self._is_thinking = False
         self._is_answering = False
         
-        message = event.data.get("message", "操作被用户拒绝") if event.data else "操作被用户拒绝"
+        payload = event.get("payload") or {}
+        message = payload.get("message", "操作被用户拒绝")
         
         self.console.print()
         self.console.print(Panel(
@@ -523,46 +529,16 @@ class UIRenderer:
             border_style="yellow",
         ))
     
-    def render_welcome(self) -> None:
-        """Render welcome screen."""
-        title = Text()
-        title.append("GorCode", style="bold cyan")
-        title.append(" v0.1.0", style="dim")
-        
-        self.console.print()
-        self.console.print(Panel.fit(
-            title,
-            subtitle="[italic dim]AI-Powered CLI Coding Assistant[/italic dim]",
-            border_style="cyan",
-        ))
-        self.console.print()
-    
     def render_help(self) -> None:
         """Render help information."""
         table = Table(show_header=True, header_style="bold cyan")
         table.add_column("Command", style="cyan")
         table.add_column("Description")
         
-        commands = [
-            ("/help", "Show this help message"),
-            ("/agent <name>", "Switch to a different agent (build, plan)"),
-            ("/model <name>", "Switch to a different model"),
-            ("/init", "Initialize GorCode in the current directory"),
-            ("/mcps", "Manage MCP servers"),
-            ("/skills", "Manage skills"),
-            ("/new", "Start a new session"),
-            ("/history list", "List session history"),
-            ("/history load <id>", "Load a session from history"),
-            ("/history search <query>", "Search session history"),
-            ("/debug on|off|status", "Control debug mode"),
-            ("/compact [--force]", "Compact conversation context"),
-            ("/context status|stats", "View context and cache statistics"),
-            ("/permission [status|grant|revoke|clear]", "Manage session permissions"),
-            ("/exit", "Exit GorCode"),
-        ]
-        
-        for cmd, desc in commands:
-            table.add_row(cmd, desc)
+        for spec in COMMAND_SPECS:
+            for cmd, desc in spec.help_entries:
+                if cmd and desc:
+                    table.add_row(cmd, desc)
         
         self.console.print()
         self.console.print(Panel(table, title="[bold]Available Commands[/bold]", border_style="cyan"))
@@ -576,8 +552,17 @@ class UIRenderer:
         table.add_column("Description")
         
         for agent in agents:
-            mode = f"[yellow]{agent.mode.value}[/yellow]"
-            table.add_row(agent.name, mode, agent.description or "")
+            if isinstance(agent, dict):
+                mode_value = agent.get("mode", "unknown")
+                name = agent.get("name", "unknown")
+                description = agent.get("description", "")
+            else:
+                mode_value = getattr(getattr(agent, "mode", None), "value", "unknown")
+                name = getattr(agent, "name", "unknown")
+                description = getattr(agent, "description", "")
+
+            mode = f"[yellow]{mode_value}[/yellow]"
+            table.add_row(name, mode, description or "")
         
         self.console.print()
         self.console.print(Panel(table, title="[bold]Available Agents[/bold]", border_style="cyan"))
@@ -591,8 +576,12 @@ class UIRenderer:
         table.add_column("Model")
         
         for name, model in models.items():
-            router = getattr(model, 'router', 'unknown')
-            model_name = getattr(model, 'model_name', str(model))
+            if isinstance(model, dict):
+                router = model.get("router", "unknown")
+                model_name = model.get("model_name") or model.get("model") or "unknown"
+            else:
+                router = getattr(model, "router", "unknown")
+                model_name = getattr(model, "model_name", str(model))
             table.add_row(name, router, model_name)
         
         self.console.print()
@@ -630,6 +619,86 @@ class UIRenderer:
     def clear(self) -> None:
         """Clear the console."""
         self.console.clear()
+
+    def _render_bash_permission(
+        self,
+        command: str,
+        border_style: str,
+        warning_text: Optional[str] = None,
+    ) -> None:
+        """Render bash permission content with optional warning."""
+        self.console.print(f"[bold cyan]操作类型:[/bold cyan] Bash命令执行")
+        self.console.print()
+        if warning_text:
+            self.console.print(warning_text)
+            self.console.print()
+        self.console.print("[bold yellow]待执行命令:[/bold yellow]")
+        self.console.print(Panel(command, border_style=border_style, expand=False))
+        self.console.print()
+
+    def _render_diff(self, content: str) -> None:
+        """Render diff content with syntax highlighting fallback."""
+        try:
+            syntax = Syntax(content, "diff", theme="monokai", line_numbers=False)
+            self.console.print(syntax)
+        except Exception:
+            self.console.print(content)
+
+    def _show_dialog_header(self, title: str) -> None:
+        """Render a dialog header with a centered title."""
+        self.console.print()
+        self.console.print("=" * 80)
+        self.console.print(title, justify="center")
+        self.console.print("=" * 80)
+        self.console.print()
+
+    def _show_dialog_footer(self) -> None:
+        """Render a dialog footer."""
+        self.console.print("=" * 80)
+        self.console.print()
+
+    def _show_options_menu(
+        self,
+        options: List[Tuple[str, str, str, str]],
+        show_top_separator: bool = True,
+    ) -> None:
+        """Render an options menu with optional top separator."""
+        if show_top_separator:
+            self.console.print("─" * 80)
+        self.console.print("[bold white]请选择操作:[/bold white]")
+        self.console.print()
+        for number, text, desc, color in options:
+            desc_text = f" [dim]({desc})[/dim]" if desc else ""
+            self.console.print(
+                f"  [bold {color}]{number}[/bold {color}] → {text}{desc_text}"
+            )
+        self.console.print()
+        self.console.print("─" * 80)
+
+    def _build_permission_options(
+        self,
+        show_view_all: bool = False,
+        show_pager: bool = False,
+    ) -> Tuple[List[Tuple[str, str, str, str]], List[str]]:
+        """Build permission dialog options and valid choice list."""
+        options: List[Tuple[str, str, str, str]] = [
+            ("1", "同意本次操作", "允许这一次", "green"),
+            ("2", "本session内一直同意", "本次会话内不再询问", "blue"),
+            ("3", "拒绝操作", "取消操作", "red"),
+        ]
+        choices = ["1", "2", "3"]
+        if show_pager:
+            options.extend(
+                [
+                    ("4", "上一页", "向前翻页", "yellow"),
+                    ("5", "下一页", "向后翻页", "yellow"),
+                ]
+            )
+            choices.extend(["4", "5"])
+        elif show_view_all:
+            options.append(("4", "查看全部改动", "支持翻页", "yellow"))
+            choices.append("4")
+        return options, choices
     
     def show_permission_dialog(
         self,
@@ -648,11 +717,7 @@ class UIRenderer:
             - response: 'once', 'always', or 'reject'
             - reason: Rejection reason string (None if not rejected)
         """
-        self.console.print()
-        self.console.print("=" * 80)
-        self.console.print("[bold yellow]⚠️  权限确认请求[/bold yellow]", justify="center")
-        self.console.print("=" * 80)
-        self.console.print()
+        self._show_dialog_header("[bold yellow]⚠️  权限确认请求[/bold yellow]")
         
         # Show different content based on permission type
         if permission_type in ("write", "edit"):
@@ -678,11 +743,7 @@ class UIRenderer:
                 
                 # Render diff with syntax highlighting
                 self.console.print()
-                try:
-                    syntax = Syntax(diff_preview, "diff", theme="monokai", line_numbers=False)
-                    self.console.print(syntax)
-                except Exception:
-                    self.console.print(diff_preview)
+                self._render_diff(diff_preview)
                 
                 if len(diff_lines) > max_lines:
                     self.console.print("[dim]可选择 4 查看全部改动[/dim]")
@@ -694,41 +755,24 @@ class UIRenderer:
                     self.console.print(Panel(content_preview + "...", border_style="dim"))
                     self.console.print()
         
-        elif permission_type == "bash":
+        elif permission_type in ("bash", "bash_delete"):
             command = metadata.get("command", "unknown")
-            self.console.print(f"[bold cyan]操作类型:[/bold cyan] Bash命令执行")
-            self.console.print()
-            self.console.print("[bold yellow]待执行命令:[/bold yellow]")
-            self.console.print(Panel(command, border_style="yellow", expand=False))
-            self.console.print()
+            if permission_type == "bash":
+                self._render_bash_permission(command, border_style="yellow")
+            else:
+                self._render_bash_permission(
+                    command,
+                    border_style="red",
+                    warning_text="[bold red]⚠️  危险警告: 此命令包含删除操作![/bold red]",
+                )
         
-        elif permission_type == "bash_delete":
-            command = metadata.get("command", "unknown")
-            self.console.print(f"[bold cyan]操作类型:[/bold cyan] Bash命令执行")
-            self.console.print()
-            self.console.print("[bold red]⚠️  危险警告: 此命令包含删除操作![/bold red]")
-            self.console.print()
-            self.console.print("[bold yellow]待执行命令:[/bold yellow]")
-            self.console.print(Panel(command, border_style="red", expand=False))
-            self.console.print()
-        
-        self.console.print("─" * 80)
-        self.console.print("[bold white]请选择操作:[/bold white]")
-        self.console.print()
-        self.console.print("  [bold green]1[/bold green] → 同意本次操作 [dim](允许这一次)[/dim]")
-        self.console.print("  [bold blue]2[/bold blue] → 本session内一直同意 [dim](本次会话内不再询问)[/dim]")
-        self.console.print("  [bold red]3[/bold red] → 拒绝操作 [dim](取消操作)[/dim]")
-        if permission_type in ("write", "edit") and metadata.get("diff", ""):
-            self.console.print("  [bold yellow]4[/bold yellow] → 查看全部改动 [dim](支持翻页)[/dim]")
-        self.console.print()
-        self.console.print("─" * 80)
+        show_view_all = permission_type in ("write", "edit") and metadata.get("diff", "")
+        options, choices = self._build_permission_options(show_view_all=bool(show_view_all))
+        self._show_options_menu(options)
         
         # Get user input
         while True:
             try:
-                choices = ["1", "2", "3"]
-                if permission_type in ("write", "edit") and metadata.get("diff", ""):
-                    choices.append("4")
                 choice = Prompt.ask(
                     "[bold]请输入选项[/bold]",
                     choices=choices,
@@ -759,26 +803,13 @@ class UIRenderer:
                 self.console.print(f"[bold yellow]全部改动 (第 {page_index + 1}/{total_pages} 页)[/bold yellow]")
                 self.console.print("─" * 80)
                 self.console.print()
-                try:
-                    syntax = Syntax(diff_page, "diff", theme="monokai", line_numbers=False)
-                    self.console.print(syntax)
-                except Exception:
-                    self.console.print(diff_page)
+                self._render_diff(diff_page)
                 
                 self.console.print()
-                self.console.print("[bold white]请选择操作:[/bold white]")
-                self.console.print()
-                self.console.print("  [bold green]1[/bold green] → 同意本次操作 [dim](允许这一次)[/dim]")
-                self.console.print("  [bold blue]2[/bold blue] → 本session内一直同意 [dim](本次会话内不再询问)[/dim]")
-                self.console.print("  [bold red]3[/bold red] → 拒绝操作 [dim](取消操作)[/dim]")
-                if total_pages > 1:
-                    self.console.print("  [bold yellow]4[/bold yellow] → 上一页 [dim](向前翻页)[/dim]")
-                    self.console.print("  [bold yellow]5[/bold yellow] → 下一页 [dim](向后翻页)[/dim]")
-                    pager_choices = ["1", "2", "3", "4", "5"]
-                else:
-                    pager_choices = ["1", "2", "3"]
-                self.console.print()
-                self.console.print("─" * 80)
+                pager_options, pager_choices = self._build_permission_options(
+                    show_pager=(total_pages > 1)
+                )
+                self._show_options_menu(pager_options, show_top_separator=False)
                 
                 try:
                     pager_choice = Prompt.ask(
@@ -829,8 +860,7 @@ class UIRenderer:
                 # 用户Ctrl+C取消 - 也视为未提供理由
                 result = ("reject", None)
         
-        self.console.print("=" * 80)
-        self.console.print()
+        self._show_dialog_footer()
         
         return result
 
@@ -844,23 +874,17 @@ class UIRenderer:
         Returns:
             "1" to retry reconnect, "2" to stop and wait.
         """
-        self.console.print()
-        self.console.print("=" * 80)
-        self.console.print("[bold yellow]⚠️  连接断开[/bold yellow]", justify="center")
-        self.console.print("=" * 80)
-        self.console.print()
+        self._show_dialog_header("[bold yellow]⚠️  连接断开[/bold yellow]")
         
         if error_message:
             self.console.print(f"[bold cyan]错误信息:[/bold cyan] {error_message}")
             self.console.print()
         
-        self.console.print("─" * 80)
-        self.console.print("[bold white]请选择操作:[/bold white]")
-        self.console.print()
-        self.console.print("  [bold green]1[/bold green] → 重新连接 [dim](继续尝试)[/dim]")
-        self.console.print("  [bold red]2[/bold red] → 暂停等待 [dim](保留当前消息)[/dim]")
-        self.console.print()
-        self.console.print("─" * 80)
+        reconnect_options = [
+            ("1", "重新连接", "继续尝试", "green"),
+            ("2", "暂停等待", "保留当前消息", "red"),
+        ]
+        self._show_options_menu(reconnect_options)
         
         # Get user input
         while True:
@@ -877,10 +901,31 @@ class UIRenderer:
                 choice = "2"
                 break
         
-        self.console.print("=" * 80)
-        self.console.print()
+        self._show_dialog_footer()
         
         return choice
+
+    def confirm_history_clear(self, count: int) -> bool:
+        """
+        Confirm clearing all history sessions.
+        
+        Args:
+            count: Number of sessions to delete
+        
+        Returns:
+            True if user confirms, False otherwise.
+        """
+        self.console.print(f"[yellow]This will delete {count} session(s).[/yellow]")
+        try:
+            choice = Prompt.ask(
+                "Type 'yes' to confirm",
+                default="no",
+                show_choices=False,
+            )
+        except (KeyboardInterrupt, EOFError):
+            return False
+        
+        return choice.strip().lower() == "yes"
     
     def show_permission_status(self, permissions: Dict[str, bool]) -> None:
         """

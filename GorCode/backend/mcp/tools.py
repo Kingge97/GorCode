@@ -8,8 +8,32 @@ Wraps MCP tools as GorCode tools.
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass
 
-from ..tools.base import BaseTool, ToolResult, ToolDefinition
+from ..tools.core_tool_support.base import BaseTool, ToolResult
+from ..tools.core_tool_support.tool_utils import tool_error_result
 from .manager import MCPManager, MCPTool, MCPConnectionStatus
+
+
+def _call_mcp_tool_sync(mcp_manager: MCPManager, tool_name: str, arguments: Dict[str, Any]) -> Any:
+    """
+    Run an async MCP tool call in a sync context.
+    """
+    import asyncio
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(mcp_manager.call_tool(tool_name, arguments))
+    finally:
+        loop.close()
+
+
+def _format_mcp_output(result: Any) -> str:
+    """
+    Normalize MCP tool output into a string.
+    """
+    if isinstance(result, dict):
+        return result.get("content", str(result))
+    return str(result)
 
 
 class MCPToolWrapper(BaseTool):
@@ -45,26 +69,14 @@ class MCPToolWrapper(BaseTool):
         Returns:
             ToolResult with the tool output
         """
-        import asyncio
-        
         arguments = arguments or {}
         
         try:
             # Run async call in sync context
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                result = loop.run_until_complete(
-                    self.mcp_manager.call_tool(tool_name, arguments)
-                )
-            finally:
-                loop.close()
+            result = _call_mcp_tool_sync(self.mcp_manager, tool_name, arguments)
             
             # Format result
-            if isinstance(result, dict):
-                output = result.get("content", str(result))
-            else:
-                output = str(result)
+            output = _format_mcp_output(result)
             
             return ToolResult(
                 success=True,
@@ -73,37 +85,28 @@ class MCPToolWrapper(BaseTool):
             )
             
         except Exception as e:
-            return ToolResult(
-                success=False,
-                output="",
-                error=str(e),
-            )
+            return tool_error_result(e)
     
-    def get_definition(self) -> ToolDefinition:
-        """Get tool definition for model API."""
-        return ToolDefinition(
-            name=self.name,
-            description=self.description,
-            parameters={
-                "type": "object",
-                "properties": {
-                    "tool_name": {
-                        "type": "string",
-                        "description": "Name of the MCP tool to call",
-                    },
-                    "arguments": {
-                        "type": "object",
-                        "description": "Arguments to pass to the tool",
-                    },
-                    "server_name": {
-                        "type": "string",
-                        "description": "Optional server name",
-                    },
+    def get_parameters(self) -> Dict[str, Any]:
+        """Get tool parameter schema."""
+        return {
+            "type": "object",
+            "properties": {
+                "tool_name": {
+                    "type": "string",
+                    "description": "Name of the MCP tool to call",
                 },
-                "required": ["tool_name"],
+                "arguments": {
+                    "type": "object",
+                    "description": "Arguments to pass to the tool",
+                },
+                "server_name": {
+                    "type": "string",
+                    "description": "Optional server name",
+                },
             },
-            category=self.category,
-        )
+            "required": ["tool_name"],
+        }
 
 
 def create_mcp_tools(mcp_manager: MCPManager) -> List[BaseTool]:
@@ -149,22 +152,9 @@ class MCPIndividualToolWrapper(BaseTool):
     
     def execute(self, **kwargs) -> ToolResult:
         """Execute the MCP tool."""
-        import asyncio
-        
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                result = loop.run_until_complete(
-                    self.mcp_manager.call_tool(self.mcp_tool.name, kwargs)
-                )
-            finally:
-                loop.close()
-            
-            if isinstance(result, dict):
-                output = result.get("content", str(result))
-            else:
-                output = str(result)
+            result = _call_mcp_tool_sync(self.mcp_manager, self.mcp_tool.name, kwargs)
+            output = _format_mcp_output(result)
             
             return ToolResult(
                 success=True,
@@ -173,17 +163,8 @@ class MCPIndividualToolWrapper(BaseTool):
             )
             
         except Exception as e:
-            return ToolResult(
-                success=False,
-                output="",
-                error=str(e),
-            )
+            return tool_error_result(e)
     
-    def get_definition(self) -> ToolDefinition:
-        """Get tool definition."""
-        return ToolDefinition(
-            name=self.name,
-            description=self.description,
-            parameters=self.mcp_tool.input_schema,
-            category=self.category,
-        )
+    def get_parameters(self) -> Dict[str, Any]:
+        """Get tool parameter schema."""
+        return self.mcp_tool.input_schema

@@ -35,6 +35,7 @@ from .shell import (
     parse_command,
     quote_arg,
     execute_command,
+    execute_command_with_timeout,
     find_command,
 )
 from .permissions import (
@@ -71,6 +72,7 @@ __all__ = [
     "parse_command",
     "quote_arg",
     "execute_command",
+    "execute_command_with_timeout",
     "find_command",
     # Permission utilities
     "PermissionUtils",

@@ -12,6 +12,8 @@ from pathlib import Path
 import json
 import uuid
 
+from ..utils.serialization import dataclass_from_dict, dataclass_to_dict, parse_datetime
+
 
 @dataclass
 class SessionMetadata:
@@ -29,31 +31,21 @@ class SessionMetadata:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
-        return {
-            "session_id": self.session_id,
-            "title": self.title,
-            "created_at": self.created_at.isoformat(),
-            "updated_at": self.updated_at.isoformat(),
-            "agent": self.agent,
-            "model": self.model,
-            "message_count": self.message_count,
-            "project_path": self.project_path,
-            "tags": self.tags,
-        }
+        return dataclass_to_dict(self)
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SessionMetadata":
         """Create from dictionary."""
-        return cls(
-            session_id=data.get("session_id", str(uuid.uuid4())),
-            title=data.get("title", ""),
-            created_at=datetime.fromisoformat(data["created_at"]) if "created_at" in data else datetime.now(),
-            updated_at=datetime.fromisoformat(data["updated_at"]) if "updated_at" in data else datetime.now(),
-            agent=data.get("agent", "build"),
-            model=data.get("model", "main"),
-            message_count=data.get("message_count", 0),
-            project_path=data.get("project_path", ""),
-            tags=data.get("tags", []),
+        return dataclass_from_dict(
+            cls,
+            data,
+            field_deserializers={
+                "created_at": lambda value: parse_datetime(value, datetime.now()),
+                "updated_at": lambda value: parse_datetime(value, datetime.now()),
+            },
+            field_defaults={
+                "session_id": lambda: str(uuid.uuid4()),
+            },
         )
 
 
@@ -136,17 +128,21 @@ class Session:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert session to dictionary."""
-        return {
-            "metadata": self.metadata.to_dict(),
-            "messages": self.messages,
-        }
+        return dataclass_to_dict(self)
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Session":
         """Create session from dictionary."""
-        metadata = SessionMetadata.from_dict(data.get("metadata", {}))
-        messages = data.get("messages", [])
-        return cls(metadata=metadata, messages=messages)
+        return dataclass_from_dict(
+            cls,
+            data,
+            field_deserializers={
+                "metadata": lambda value: SessionMetadata.from_dict(value or {}),
+            },
+            field_defaults={
+                "metadata": lambda: SessionMetadata.from_dict({}),
+            },
+        )
     
     @classmethod
     def create_new(
@@ -217,12 +213,4 @@ class SessionSearchResult:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
-        return {
-            "session_id": self.session_id,
-            "title": self.title,
-            "created_at": self.created_at.isoformat(),
-            "updated_at": self.updated_at.isoformat(),
-            "message_count": self.message_count,
-            "agent": self.agent,
-            "preview": self.preview,
-        }
+        return dataclass_to_dict(self)

@@ -21,11 +21,13 @@ Usage:
     - "Build an MCP server" -> Skill("mcp-builder")
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
+import os
 from pathlib import Path
 
-from .base import BaseTool, ToolResult, ToolDefinition
-from ..skills import SkillLoader, SkillInjector
+from .core_tool_support.base import BaseTool, ToolResult
+from .core_tool_support.tool_utils import build_parameters_schema
+from ..skills import SkillLoader
 
 
 class SkillTool(BaseTool):
@@ -41,9 +43,9 @@ class SkillTool(BaseTool):
     - Before attempting domain-specific work (PDF, MCP, etc.)
     - When you need detailed instructions for a specialized task
     
-    The skill content will be injected into the conversation as a tool_result,
-    giving you detailed instructions and access to resources while preserving
-    the prompt cache.
+    The skill content (SKILL.md only) will be injected into the conversation
+    as a tool_result, giving you detailed instructions while preserving the
+    prompt cache.
     """
     
     name = "Skill"
@@ -54,8 +56,8 @@ Use this tool IMMEDIATELY when:
 - You need domain-specific knowledge or best practices
 - You're about to attempt specialized work you're not sure about
 
-The skill content will be injected as a tool result, giving you detailed
-instructions while preserving prompt cache efficiency."""
+The skill content (SKILL.md only) will be injected as a tool result, giving you
+detailed instructions while preserving prompt cache efficiency."""
     category = "knowledge"
     needs_encoding = False
     
@@ -63,6 +65,7 @@ instructions while preserving prompt cache efficiency."""
         self,
         default_encoding: str = "utf-8",
         skill_loader: SkillLoader = None,
+        base_dir: Optional[str] = None,
     ):
         """
         Initialize Skill tool.
@@ -73,15 +76,24 @@ instructions while preserving prompt cache efficiency."""
         """
         super().__init__(default_encoding)
         self._skill_loader = skill_loader
-        self._skill_injector = None
-        
-        if self._skill_loader:
-            self._skill_injector = SkillInjector(self._skill_loader)
+        self._base_dir = Path(base_dir).resolve() if base_dir else None
     
     def set_skill_loader(self, skill_loader: SkillLoader) -> None:
-        """Set the skill loader and create injector."""
+        """Set the skill loader."""
         self._skill_loader = skill_loader
-        self._skill_injector = SkillInjector(skill_loader)
+
+    def set_base_dir(self, base_dir: Optional[str]) -> None:
+        """Set the base directory for relative path display."""
+        self._base_dir = Path(base_dir).resolve() if base_dir else None
+
+    def _get_relative_skill_dir(self, skill_dir: str) -> str:
+        """Return skill directory relative to base_dir when possible."""
+        if not self._base_dir:
+            return skill_dir
+        try:
+            return str(Path(skill_dir).resolve().relative_to(self._base_dir))
+        except Exception:
+            return os.path.relpath(Path(skill_dir).resolve(), self._base_dir)
     
     def _get_available_skills(self) -> Dict[str, str]:
         """
@@ -138,24 +150,26 @@ instructions while preserving prompt cache efficiency."""
                 error=f"Unknown skill '{skill}'. Available: {available}"
             )
         
-        # Get full content with resources
-        content = skill_obj.get_full_content(include_resources=True, encoding=self.default_encoding)
+        # Only load the first layer (SKILL.md content); resources are not inlined.
+        content = skill_obj.get_full_content(include_resources=False, encoding=self.default_encoding)
         
         # OpenCode-style: Add Base directory information for path resolution
         skill_dir = str(skill_obj.path)
+        relative_skill_dir = self._get_relative_skill_dir(skill_dir)
         
         # Wrap in skill-loaded tags (like v4_skills_agent.py)
         wrapped_content = f"""<skill-loaded name="{skill}">
-## Skill: {skill}
+**技能目录（相对主目录）**: {relative_skill_dir}
+**技能目录（绝对路径）**: {skill_dir}
 
-**Base directory**: {skill_dir}
+## Skill: {skill}
 
 {content}
 </skill-loaded>
 
 Follow the instructions in the skill above to complete the user's task.
 
-Note: When executing commands from this skill, use the **Base directory** above to resolve relative paths. For example, if the skill references `scripts/office/soffice.py`, the full path would be `{skill_dir}/scripts/office/soffice.py`."""
+Note: Resources are NOT auto-loaded. If the skill references files, read them explicitly using the file tools and the skill directory above to resolve relative paths. For example, if the skill references `scripts/office/soffice.py`, the full path would be `{relative_skill_dir}/scripts/office/soffice.py` (relative to project root)."""
         
         return ToolResult(
             success=True,
@@ -164,22 +178,15 @@ Note: When executing commands from this skill, use the **Base directory** above 
                 "skill_name": skill,
                 "skill_dir": skill_dir,
                 "content_length": len(wrapped_content),
-                "resource_count": len(skill_obj.resources),
             }
         )
     
-    def get_definition(self) -> ToolDefinition:
+    def get_description(self) -> str:
         """
-        Get tool definition for model API.
-        
-        Returns:
-            ToolDefinition with dynamic skill descriptions
+        Get tool description for model API with dynamic skill list.
         """
         skill_descriptions = self._format_skill_descriptions()
-        
-        return ToolDefinition(
-            name=self.name,
-            description=f"""Load a skill to gain specialized knowledge for a task.
+        return f"""Load a skill to gain specialized knowledge for a task.
 
 Available skills:
 {skill_descriptions}
@@ -189,18 +196,18 @@ When to use:
 - Before attempting domain-specific work (PDF, MCP, etc.)
 - When you need detailed instructions for specialized tasks
 
-The skill content will be injected into the conversation, giving you
-detailed instructions and access to resources.""",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "skill": {
-                        "type": "string",
-                        "description": "Name of the skill to load",
-                        "enum": list(self._get_available_skills().keys()) if self._skill_loader else []
-                    }
-                },
-                "required": ["skill"]
+        The skill content (SKILL.md only) will be injected into the conversation,
+        giving you detailed instructions."""
+
+    def get_parameters(self) -> Dict[str, Any]:
+        """Get tool parameter schema with dynamic skill options."""
+        return build_parameters_schema(
+            properties={
+                "skill": {
+                    "type": "string",
+                    "description": "Name of the skill to load",
+                    "enum": list(self._get_available_skills().keys()) if self._skill_loader else []
+                }
             },
-            category=self.category
+            required=["skill"],
         )

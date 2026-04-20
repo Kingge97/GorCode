@@ -9,19 +9,9 @@ import json
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from dataclasses import dataclass, field
 
-from .manager import ConfigManager, GorCodeConfig, ModelConnection
-
-
-@dataclass
-class InitResult:
-    """Result of initialization process."""
-    
-    success: bool
-    message: str
-    created_paths: List[str] = field(default_factory=list)
-    errors: List[str] = field(default_factory=list)
+from .manager import ConfigManager, GorCodeConfig
+from ...shared.types import InitResult
 
 
 class ProjectInitializer:
@@ -186,48 +176,11 @@ class ProjectInitializer:
     
     def _create_default_user_config(self) -> GorCodeConfig:
         """Create default user configuration."""
-        config = GorCodeConfig()
-        
-        # Default model connections
-        config.model_connections = {
-            "main": ModelConnection(
-                name="main",
-                base_url="https://api.openai.com/v1",
-                api_key="YOUR_API_KEY_HERE",
-                model_name="gpt-4",
-                router="openai-chat",
-                stream=True,
-            ),
-            "mini": ModelConnection(
-                name="mini",
-                base_url="https://api.openai.com/v1",
-                api_key="YOUR_API_KEY_HERE",
-                model_name="gpt-3.5-turbo",
-                router="openai-chat",
-                stream=True,
-            ),
-        }
-        
-        # Agent to model mapping
-        config.agent_model_mapping = {
-            "build": "main",
-            "plan": "main",
-            "explore": "mini",
-            "general": "mini",
-            "compaction": "mini",
-        }
-        
-        return config
+        return ConfigManager.build_default_user_config()
     
     def _create_default_project_config(self) -> GorCodeConfig:
         """Create default project configuration (minimal, inherits from user config)."""
-        config = GorCodeConfig()
-        
-        # Project-specific settings (empty to inherit from user config)
-        config.model_connections = {}
-        config.default_agent = "build"
-        
-        return config
+        return ConfigManager.build_default_project_config()
     
     def _save_config(self, path: Path, config: GorCodeConfig) -> None:
         """Save configuration to file."""
