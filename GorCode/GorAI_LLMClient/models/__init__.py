@@ -15,7 +15,15 @@ __all__ = [
     "create_model"
 ]
 
-def create_model(base_url, api_key, model_name, stream=True, extra_args=None, router="openai-chat"):
+def create_model(
+    base_url,
+    api_key,
+    model_name,
+    stream=True,
+    extra_args=None,
+    router="openai-chat",
+    hooks=None,
+):
     """
     根据router参数创建对应的模型实例
 
@@ -26,6 +34,7 @@ def create_model(base_url, api_key, model_name, stream=True, extra_args=None, ro
         stream: 是否使用流式输出
         extra_args: 额外参数
         router: 路由类型，决定使用哪种模型实现
+        hooks: 可选的生命周期 hook 注册项
 
     Returns:
         模型实例
@@ -37,7 +46,8 @@ def create_model(base_url, api_key, model_name, stream=True, extra_args=None, ro
             model_name=model_name,
             stream=stream,
             extra_args=extra_args,
-            router=router
+            router=router,
+            hooks=hooks,
         )
     elif router == "anthropic":
         return anthropic_model(
@@ -46,7 +56,8 @@ def create_model(base_url, api_key, model_name, stream=True, extra_args=None, ro
             model_name=model_name,
             stream=stream,
             extra_args=extra_args,
-            router=router
+            router=router,
+            hooks=hooks,
         )
     elif router == "openai-chat-interleaved":
         return openai_chat_interleaved_model(
@@ -55,7 +66,8 @@ def create_model(base_url, api_key, model_name, stream=True, extra_args=None, ro
             model_name=model_name,
             stream=stream,
             extra_args=extra_args,
-            router=router
+            router=router,
+            hooks=hooks,
         )
     elif router == "anthropic-interleaved":
         return anthropic_interleaved_model(
@@ -64,7 +76,8 @@ def create_model(base_url, api_key, model_name, stream=True, extra_args=None, ro
             model_name=model_name,
             stream=stream,
             extra_args=extra_args,
-            router=router
+            router=router,
+            hooks=hooks,
         )
     elif router == "openai-response":
         return openai_response_model(
@@ -73,7 +86,8 @@ def create_model(base_url, api_key, model_name, stream=True, extra_args=None, ro
             model_name=model_name,
             stream=stream,
             extra_args=extra_args,
-            router=router
+            router=router,
+            hooks=hooks,
         )
 
     else:

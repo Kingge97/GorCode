@@ -5,14 +5,20 @@ Session Manager
 Manages session lifecycle and coordinates with backend executor.
 """
 
+from copy import deepcopy
 from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Callable
+from typing import Any, Dict, List, Optional
 import threading
 
-from .models import Session, SessionMetadata, SessionSearchResult
+from .models import Session, SessionSearchResult
 from .storage import SessionStorage
+from .scope import SCOPE_ALL, SCOPE_PROJECT, normalize_project_path
 from ..core.events import EventBus, Event, EventType
+from ..context.token_usage import empty_token_usage_dict, normalize_usage_payload
+
+
+class SessionCloneError(RuntimeError):
+    """Raised when a history session cannot be cloned safely."""
 
 
 class SessionManager:
@@ -46,7 +52,7 @@ class SessionManager:
         """
         self.event_bus = event_bus or EventBus()
         self.storage = storage or SessionStorage()
-        self.project_path = project_path
+        self.project_path = normalize_project_path(project_path)
         
         self._current_session: Optional[Session] = None
         self._message_count_since_save = 0
@@ -146,6 +152,81 @@ class SessionManager:
             self._start_autosave_timer()
         
         return session
+
+    def clone_session_for_current_project(
+        self,
+        source_session: Session,
+        source: Dict[str, str],
+        agent: str,
+        model: str,
+    ) -> Session:
+        """Clone a loaded history session into a fresh current-project session."""
+        self._save_current_before_load()
+        self._validate_source_messages(source_session.messages)
+        clone = self._build_session_clone(source_session, source, agent, model)
+        self._current_session = clone
+        self._message_count_since_save = 0
+        if not self.storage.save(clone):
+            raise SessionCloneError("Failed to save cloned session")
+        self.event_bus.emit(EventType.SESSION_LOAD, {
+            "session_id": clone.session_id,
+            "source_session_id": source.get("session_id", ""),
+            "message_count": len(clone.messages),
+        })
+        self._start_autosave_timer()
+        return clone
+
+    def _save_current_before_load(self) -> None:
+        if self._current_session and not self.save_current_session():
+            raise SessionCloneError("Failed to save current session before loading history")
+
+    def _validate_source_messages(self, messages: Any) -> None:
+        if not isinstance(messages, list):
+            raise SessionCloneError("Session messages must be a list")
+        for index, message in enumerate(messages):
+            self._validate_source_message(index, message)
+
+    def _validate_source_message(self, index: int, message: Any) -> None:
+        if not isinstance(message, dict):
+            raise SessionCloneError(f"Invalid message at index {index}: expected object")
+        if "role" not in message:
+            raise SessionCloneError(f"Invalid message at index {index}: missing role")
+        if "content" not in message:
+            raise SessionCloneError(f"Invalid message at index {index}: missing content")
+
+    def _build_session_clone(
+        self,
+        source_session: Session,
+        source: Dict[str, str],
+        agent: str,
+        model: str,
+    ) -> Session:
+        now = datetime.now()
+        clone = Session.create_new(
+            agent=agent,
+            model=model,
+            project_path=self.project_path,
+            title=source_session.title,
+        )
+        clone.messages = deepcopy(source_session.messages)
+        clone.metadata.created_at = now
+        clone.metadata.updated_at = now
+        clone.metadata.message_count = len(clone.messages)
+        clone.metadata.token_usage = empty_token_usage_dict()
+        self._set_clone_source_metadata(clone, source_session, source)
+        return clone
+
+    def _set_clone_source_metadata(
+        self,
+        clone: Session,
+        source_session: Session,
+        source: Dict[str, str],
+    ) -> None:
+        clone.metadata.source_kind = source.get("kind", "")
+        clone.metadata.source_session_id = source.get("session_id", "")
+        clone.metadata.source_path = source.get("path", "")
+        clone.metadata.source_agent = source_session.metadata.agent
+        clone.metadata.source_model = source_session.metadata.model
     
     def close_session(self) -> bool:
         """
@@ -238,6 +319,18 @@ class SessionManager:
         if self._current_session:
             self._current_session.clear_messages()
             self._message_count_since_save = 0
+
+    def set_token_usage(self, usage: Dict[str, Any]) -> None:
+        """Set real provider token usage metadata for the current session."""
+        if self._current_session:
+            self._current_session.metadata.token_usage = normalize_usage_payload(usage)
+            self._current_session.metadata.updated_at = datetime.now()
+
+    def clear_token_usage(self) -> None:
+        """Clear real provider token usage metadata for the current session."""
+        if self._current_session:
+            self._current_session.metadata.token_usage = empty_token_usage_dict()
+            self._current_session.metadata.updated_at = datetime.now()
     
     # ========================
     # State Management
@@ -364,6 +457,7 @@ class SessionManager:
         limit: int = 20,
         offset: int = 0,
         sort_by: str = "updated_at",
+        scope: str = SCOPE_PROJECT,
     ) -> List[SessionSearchResult]:
         """
         List recent sessions.
@@ -372,6 +466,7 @@ class SessionManager:
             limit: Maximum results
             offset: Pagination offset
             sort_by: Sort field
+            scope: project for current-project history, all for global history
             
         Returns:
             List of session search results
@@ -380,12 +475,15 @@ class SessionManager:
             limit=limit,
             offset=offset,
             sort_by=sort_by,
+            scope=scope,
+            project_path=self.project_path,
         )
     
     def search_sessions(
         self,
         query: str,
         limit: int = 10,
+        scope: str = SCOPE_PROJECT,
     ) -> List[SessionSearchResult]:
         """
         Search sessions.
@@ -393,18 +491,20 @@ class SessionManager:
         Args:
             query: Search query
             limit: Maximum results
+            scope: project for current-project history, all for global history
             
         Returns:
             List of matching sessions
         """
-        return self.storage.search(query, limit)
+        return self.storage.search(query, limit, scope=scope, project_path=self.project_path)
     
-    def delete_session(self, session_id: str) -> bool:
+    def delete_session(self, session_id: str, scope: str = SCOPE_PROJECT) -> bool:
         """
         Delete a session.
         
         Args:
             session_id: Session ID to delete
+            scope: project for current-project history, all for global history
             
         Returns:
             True if successful
@@ -413,15 +513,17 @@ class SessionManager:
         if self._current_session and self._current_session.session_id == session_id:
             return False
         
+        if not self.storage.load_scoped(session_id, scope, self.project_path):
+            return False
         return self.storage.delete(session_id)
     
-    def get_session_count(self) -> int:
+    def get_session_count(self, scope: str = SCOPE_ALL) -> int:
         """Get total session count."""
-        return self.storage.count()
+        return self.storage.count(scope=scope, project_path=self.project_path)
 
-    def list_session_ids(self) -> List[str]:
+    def list_session_ids(self, scope: str = SCOPE_ALL) -> List[str]:
         """List all stored session IDs."""
-        return self.storage.list_session_ids()
+        return self.storage.list_session_ids(scope=scope, project_path=self.project_path)
     
     # ========================
     # Utility Methods

@@ -1,9 +1,18 @@
 from abc import ABC, abstractmethod
 import json
-from typing import Optional, Callable
+from ..hooks import HookEvent, HookManager
 
 class model_base(ABC):
-    def __init__(self, base_url, api_key, model_name, stream=True, extra_args=None, router=None):
+    def __init__(
+        self,
+        base_url,
+        api_key,
+        model_name,
+        stream=True,
+        extra_args=None,
+        router=None,
+        hooks=None,
+    ):
         """
         模型基础类
 
@@ -14,6 +23,7 @@ class model_base(ABC):
             stream: 是否使用流式输出
             extra_args: 额外参数
             router: 路由类型
+            hooks: 可选的生命周期 hook 注册项
         """
         self.base_url = base_url
         self.api_key = api_key
@@ -23,6 +33,40 @@ class model_base(ABC):
         self.router = router
         self.tools = []
         self.tool_dict = {}
+        self.hooks = HookManager(hooks)
+
+    def add_hook(self, event, handler, priority=0, name=None):
+        return self.hooks.add_hook(
+            event,
+            handler,
+            priority=priority,
+            name=name,
+        )
+
+    def remove_hook(self, event, handler_or_name):
+        return self.hooks.remove_hook(event, handler_or_name)
+
+    def _run_lifecycle_hooks(
+        self,
+        event,
+        messages,
+        *,
+        loop_round,
+        previous_round_had_tools,
+        tool_info=None,
+        metadata=None,
+    ):
+        event_value = event.value if isinstance(event, HookEvent) else event
+        return self.hooks.run(
+            event_value,
+            target_messages=messages,
+            router=self.router or self.__class__.__name__,
+            model_name=self.model_name,
+            loop_round=loop_round,
+            previous_round_had_tools=previous_round_had_tools,
+            tool_info=tool_info,
+            metadata=metadata,
+        )
 
     @abstractmethod
     def model_chat(self, messages):
@@ -226,8 +270,18 @@ class model_base(ABC):
         # 注意：直接使用传入的 messages，不创建副本，这样工具调用和助手回复会保留在消息历史中
         is_first_round = True  # 是否是第一轮对话
         tool_info = []  # 工具调用信息
+        loop_round = 0
+        previous_round_had_tools = False
+        hook_metadata = {}
 
         try:
+            hook_metadata = self._run_lifecycle_hooks(
+                HookEvent.BEFORE_LOOP_START,
+                messages,
+                loop_round=loop_round,
+                previous_round_had_tools=previous_round_had_tools,
+                metadata=hook_metadata,
+            )
             # 对话循环
             while is_first_round or tool_info:
                 is_first_round = False
@@ -241,6 +295,13 @@ class model_base(ABC):
                 # print("=" * 20 + "思考过程" + "=" * 20)
 
                 # 调用 model_chat
+                hook_metadata = self._run_lifecycle_hooks(
+                    HookEvent.BEFORE_MODEL_REQUEST,
+                    messages,
+                    loop_round=loop_round,
+                    previous_round_had_tools=previous_round_had_tools,
+                    metadata=hook_metadata,
+                )
                 response = self.model_chat(messages)
 
                 # 处理响应
@@ -248,6 +309,14 @@ class model_base(ABC):
                     # 检查中断标志
                     if interrupt_check():
                         # print(f"\n检测到中断请求，停止对话")
+                        self._run_lifecycle_hooks(
+                            HookEvent.ON_INTERRUPT,
+                            messages,
+                            loop_round=loop_round,
+                            previous_round_had_tools=previous_round_had_tools,
+                            tool_info=tool_info,
+                            metadata=hook_metadata,
+                        )
                         yield b"data: " + encode_json({'type': 'interrupted', 'message': '对话已被用户中断'}) + b"\n\n"
                         return
 
@@ -255,6 +324,14 @@ class model_base(ABC):
                     if item.gorType == "error":
                         error_msg = item.content
                         # print(f"\n模型调用错误: {error_msg}")
+                        self._run_lifecycle_hooks(
+                            HookEvent.ON_ERROR,
+                            messages,
+                            loop_round=loop_round,
+                            previous_round_had_tools=previous_round_had_tools,
+                            tool_info=tool_info,
+                            metadata={**hook_metadata, "error": error_msg},
+                        )
                         yield b"data: " + encode_json({'type': 'error', 'message': error_msg}) + b"\n\n"
                         # 错误时退出循环
                         return
@@ -263,6 +340,14 @@ class model_base(ABC):
                     elif item.gorType == "connection_error":
                         error_msg = item.content
                         # print(f"\n连接断开: {error_msg}")
+                        self._run_lifecycle_hooks(
+                            HookEvent.ON_ERROR,
+                            messages,
+                            loop_round=loop_round,
+                            previous_round_had_tools=previous_round_had_tools,
+                            tool_info=tool_info,
+                            metadata={**hook_metadata, "error": error_msg},
+                        )
                         yield b"data: " + encode_json({
                             'type': 'connection_error',
                             'message': error_msg,
@@ -270,6 +355,9 @@ class model_base(ABC):
                         }) + b"\n\n"
                         # 连接断开时退出循环，但保留 messages 供恢复使用
                         return
+
+                    elif item.gorType == "usage":
+                        yield self._make_usage_sse(item, encode_json)
 
                     # 处理思考内容
                     elif item.gorType == "think":
@@ -302,20 +390,60 @@ class model_base(ABC):
                         # print("\n" + "=" * 30 + "本次结束" + "=" * 30)
                         pass
 
+                hook_metadata = self._run_lifecycle_hooks(
+                    HookEvent.AFTER_MODEL_RESPONSE,
+                    messages,
+                    loop_round=loop_round,
+                    previous_round_had_tools=previous_round_had_tools,
+                    tool_info=tool_info,
+                    metadata={
+                        **hook_metadata,
+                        "answer_content": answer_content,
+                        "reasoning_content": reasoning_content,
+                    },
+                )
                 # 如果有工具调用，执行工具并继续循环
                 if tool_info:
                     # 检查中断标志
                     if interrupt_check():
                         # print(f"\n检测到中断请求，停止工具执行")
+                        self._run_lifecycle_hooks(
+                            HookEvent.ON_INTERRUPT,
+                            messages,
+                            loop_round=loop_round,
+                            previous_round_had_tools=previous_round_had_tools,
+                            tool_info=tool_info,
+                            metadata=hook_metadata,
+                        )
                         yield b"data: " + encode_json({'type': 'interrupted', 'message': '对话已被用户中断'}) + b"\n\n"
                         return
 
                     # 执行工具调用
-                    yield from self._execute_tools_in_loop(tool_info, messages, executor, encode_json, interrupt_check)
+                    hook_metadata = yield from self._execute_tools_in_loop(
+                        tool_info,
+                        messages,
+                        executor,
+                        encode_json,
+                        interrupt_check,
+                        loop_round=loop_round,
+                        previous_round_had_tools=previous_round_had_tools,
+                        metadata=hook_metadata,
+                    )
+                    hook_metadata = self._run_lifecycle_hooks(
+                        HookEvent.BEFORE_NEXT_LOOP,
+                        messages,
+                        loop_round=loop_round,
+                        previous_round_had_tools=True,
+                        tool_info=tool_info,
+                        metadata=hook_metadata,
+                    )
+                    previous_round_had_tools = True
                 else:
                     # 没有工具调用，但有自然语言回答时，追加assistant消息到历史记录
                     if answer_content:
                         messages.append({'role': 'assistant', 'content': answer_content})
+                    previous_round_had_tools = False
+                loop_round += 1
 
             # 循环结束后，如果最后一轮有自然语言回答且之前发生过工具调用，也需要追加
             # 检查最后是否是工具调用后的回答（tool_info从有变为空的情况）
@@ -324,6 +452,13 @@ class model_base(ABC):
                 if not (messages and messages[-1].get('role') == 'assistant' and messages[-1].get('content') == answer_content):
                     messages.append({'role': 'assistant', 'content': answer_content})
 
+            self._run_lifecycle_hooks(
+                HookEvent.AFTER_LOOP_END,
+                messages,
+                loop_round=loop_round,
+                previous_round_had_tools=previous_round_had_tools,
+                metadata=hook_metadata,
+            )
             yield b"data: " + encode_json({'type': 'end'}) + b"\n\n"
 
         except Exception as e:
@@ -333,7 +468,24 @@ class model_base(ABC):
             # print(traceback.format_exc())
             yield b"data: " + encode_json({'type': 'error', 'message': error_msg}) + b"\n\n"
 
-    def _execute_tools_in_loop(self, tool_info, messages, executor, encode_json, interrupt_check):
+    def _make_usage_sse(self, item, encode_json):
+        usage = (item.extra or {}).get("usage")
+        if usage is None:
+            usage = json.loads(item.content)
+        return b"data: " + encode_json({"type": "usage", "usage": usage}) + b"\n\n"
+
+    def _execute_tools_in_loop(
+        self,
+        tool_info,
+        messages,
+        executor,
+        encode_json,
+        interrupt_check,
+        *,
+        loop_round,
+        previous_round_had_tools,
+        metadata,
+    ):
         """
         执行工具调用并更新消息历史
 
@@ -363,6 +515,14 @@ class model_base(ABC):
                     "arguments": tool["arguments"]
                 }
             })
+            assistant_message["tool_calls"].append({
+                "id": tool["id"],
+                "function": {
+                    "arguments": tool["arguments"],
+                    "name": tool["name"],
+                },
+                "type": "function",
+            })
 
         # 发送工具调用通知
         yield b"data: " + encode_json({'type': 'tool_calls', 'tool_calls': tool_calls_for_frontend}) + b"\n\n"
@@ -370,9 +530,19 @@ class model_base(ABC):
         # 执行工具调用
         # print("工具数量：" + str(len(tool_info)))
         for tool in tool_info:
+            tool_name = tool.get("name", "unknown")
+            tool_call_id = tool.get("id", "")
             # 检查中断标志
             if interrupt_check():
                 # print(f"\n检测到中断请求，停止工具执行")
+                self._run_lifecycle_hooks(
+                    HookEvent.ON_INTERRUPT,
+                    messages,
+                    loop_round=loop_round,
+                    previous_round_had_tools=previous_round_had_tools,
+                    tool_info=[tool],
+                    metadata=metadata,
+                )
                 yield b"data: " + encode_json({'type': 'interrupted', 'message': '对话已被用户中断'}) + b"\n\n"
                 return
 
@@ -392,6 +562,14 @@ class model_base(ABC):
                     }) + b"\n\n"
                     # 添加错误结果到消息历史
                     messages.append({"role": "tool", "tool_call_id": tool.get('id', ''), "content": error_msg})
+                    metadata = self._run_lifecycle_hooks(
+                        HookEvent.AFTER_TOOL_EXECUTION,
+                        messages,
+                        loop_round=loop_round,
+                        previous_round_had_tools=previous_round_had_tools,
+                        tool_info=[tool],
+                        metadata={**metadata, "tool_error": error_msg},
+                    )
                     continue
 
                 tool_name = tool["name"]
@@ -402,6 +580,14 @@ class model_base(ABC):
                 # 发送工具执行通知
                 yield b"data: " + encode_json({'type': 'tool_execution', 'tool_name': tool_name, 'tool_call_id': tool_call_id, 'args': tool_args}) + b"\n\n"
 
+                metadata = self._run_lifecycle_hooks(
+                    HookEvent.BEFORE_TOOL_EXECUTION,
+                    messages,
+                    loop_round=loop_round,
+                    previous_round_had_tools=previous_round_had_tools,
+                    tool_info=[{**tool, "parsed_arguments": tool_args}],
+                    metadata=metadata,
+                )
                 # 执行工具
                 result = executor.execute_tool(tool_name, tool_args)
                                 
@@ -422,18 +608,28 @@ class model_base(ABC):
                 yield b"data: " + encode_json({'type': 'tool_result', 'tool_name': tool_name, 'tool_call_id': tool_call_id, 'result': str(result)}) + b"\n\n"
 
                 # 更新消息历史
-                assistant_message["tool_calls"].append({
-                    "id": tool_call_id,
-                    "function": {"arguments": tool["arguments"], "name": tool["name"]},
-                    "type": 'function'
-                })
                 # 根据结果类型构建工具消息
                 messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": tool_result_content})
+                metadata = self._run_lifecycle_hooks(
+                    HookEvent.AFTER_TOOL_EXECUTION,
+                    messages,
+                    loop_round=loop_round,
+                    previous_round_had_tools=previous_round_had_tools,
+                    tool_info=[{**tool, "parsed_arguments": tool_args}],
+                    metadata={**metadata, "tool_result": result},
+                )
 
             except Exception as e:
                 error_msg = f"工具执行错误: {str(e)}"
                 # print(f"工具执行错误: {e}")
                 yield b"data: " + encode_json({'type': 'tool_result', 'tool_name': tool_name, 'tool_call_id': tool_call_id, 'result': error_msg}) + b"\n\n"
                 messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": error_msg})
-
-
+                metadata = self._run_lifecycle_hooks(
+                    HookEvent.AFTER_TOOL_EXECUTION,
+                    messages,
+                    loop_round=loop_round,
+                    previous_round_had_tools=previous_round_had_tools,
+                    tool_info=[tool],
+                    metadata={**metadata, "tool_error": error_msg},
+                )
+        return metadata

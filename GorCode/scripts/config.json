@@ -32,5 +32,25 @@
   "default_encoding": "utf-8",
   "debug_mode": false,
   "max_context_length": 128000,
+  "compression_settings": {
+    "enabled": true,
+    "algorithm": "gorcode_builtin",
+    "trigger": {
+      "event": "before_model_request",
+      "threshold_ratio": 0.85
+    },
+    "algorithms": {
+      "gorcode_builtin": {
+        "type": "builtin",
+        "name": "gorcode_builtin",
+        "options": {
+          "soft_enabled": true,
+          "hard_enabled": true,
+          "hard_keep_turns": 1,
+          "protected_tools": ["skill", "Skill"]
+        }
+      }
+    }
+  },
   "mcp_servers": {}
 }

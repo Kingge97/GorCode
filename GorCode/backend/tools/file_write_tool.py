@@ -53,17 +53,7 @@ class WriteTool(BaseTool):
         content: str,
         encoding: str = None,
     ) -> ToolResult:
-        """
-        Write content to file.
-
-        Args:
-            file_path: Path to the file to write
-            content: Content to write to the file
-            encoding: File encoding
-
-        Returns:
-            ToolResult with write status and permission metadata
-        """
+        """Write content to file."""
         try:
             path = Path(file_path)
             file_exists = path.exists()
@@ -80,24 +70,14 @@ class WriteTool(BaseTool):
             old_content, _ = _read_existing_content(path, encoding, self.default_encoding)
             line_ending = _resolve_line_ending(old_content, self._settings)
             normalized_content = _normalize_content(content, line_ending, self._settings)
-
-            diff = generate_unified_diff(old_content, normalized_content, str(path))
-            git_diff = generate_git_diff(old_content, normalized_content, str(path))
-            structured = build_structured_diff(old_content, normalized_content)
-
-            return build_permission_preview_result(
-                f"Ready to write {len(normalized_content)} characters to {file_path}",
-                {
-                    "file_path": str(path),
-                    "chars_to_write": len(normalized_content),
-                    "file_exists": file_exists,
-                    "diff": diff,
-                    "git_diff": git_diff,
-                    "structured_diff": structured,
-                    "line_ending": line_ending,
-                    "content": normalized_content,
-                    "encoding": resolve_encoding(encoding, self.default_encoding),
-                },
+            return _build_write_preview(
+                file_path,
+                path,
+                old_content,
+                normalized_content,
+                file_exists,
+                line_ending,
+                resolve_encoding(encoding, self.default_encoding),
             )
 
         except Exception as exc:
@@ -202,7 +182,7 @@ def _validate_preconditions(
             return ToolResult(
                 success=False,
                 output="",
-                error="Write requires a full ReadTool snapshot first",
+                error="Write requires a full file snapshot before overwriting an existing file",
             )
     if settings.enforce_mtime_check:
         if not cache:
@@ -222,7 +202,7 @@ def _validate_preconditions(
             return ToolResult(
                 success=False,
                 output="",
-                error="File modified since last read; aborting write",
+                error="File modified since last read/edit/write; read the file again before writing",
             )
     return None
 
@@ -241,3 +221,28 @@ def _normalize_content(content: str, line_ending: str, settings: FileToolSetting
     if not settings.preserve_line_endings:
         return content
     return normalize_line_endings(content, line_ending)
+
+
+def _build_write_preview(
+    file_path: str,
+    path: Path,
+    old_content: str,
+    normalized_content: str,
+    file_exists: bool,
+    line_ending: str,
+    encoding: str,
+) -> ToolResult:
+    return build_permission_preview_result(
+        f"Ready to write {len(normalized_content)} characters to {file_path}",
+        {
+            "file_path": str(path),
+            "chars_to_write": len(normalized_content),
+            "file_exists": file_exists,
+            "diff": generate_unified_diff(old_content, normalized_content, str(path)),
+            "git_diff": generate_git_diff(old_content, normalized_content, str(path)),
+            "structured_diff": build_structured_diff(old_content, normalized_content),
+            "line_ending": line_ending,
+            "content": normalized_content,
+            "encoding": encoding,
+        },
+    )

@@ -5,11 +5,17 @@ Message Summarizer
 Generate summaries of message conversations.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from dataclasses import dataclass
+import copy
 import re
 
 from .token_estimator import TokenEstimator
+from ..agents.loader import AgentLoader
+
+
+class SummaryGenerationError(Exception):
+    """Raised when the model does not provide a valid compaction summary."""
 
 
 @dataclass
@@ -109,56 +115,67 @@ class MessageSummarizer:
             Summary string
         """
         if not self.model_connector:
-            return "[Summary unavailable - no model connector]"
+            raise SummaryGenerationError("Summary generation failed: no model connector")
         
-        # Build summarization prompt
-        conversation_text = self._format_messages_for_summary(messages)
-        
-        prompt = f"""Summarize the following conversation concisely. Focus on:
-1. What the user requested
-2. What was done
-3. Current state / what's being worked on
-4. Files modified or created
-5. Important decisions or constraints
+        compaction_messages = self._build_compaction_messages(messages, max_tokens)
+        return self._collect_final_summary(compaction_messages)
 
-Conversation:
-{conversation_text}
+    def _build_compaction_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        max_tokens: int,
+    ) -> List[Dict[str, Any]]:
+        prompt = self._load_compaction_prompt()
+        return [
+            {"role": "system", "content": prompt},
+            *self._conversation_messages(messages),
+            {"role": "user", "content": self._compression_request(max_tokens)},
+        ]
 
-Provide a detailed but concise summary (target {max_tokens} tokens):"""
+    def _load_compaction_prompt(self) -> str:
+        agent = AgentLoader().load_agent("compaction")
+        if not agent or not agent.prompt:
+            raise SummaryGenerationError("Summary generation failed: compaction agent not found")
+        return agent.prompt
 
-        try:
-            # Use the model to generate summary
-            # chat() returns a generator, need to collect all responses
-            response_generator = self.model_connector.chat([
-                {"role": "user", "content": prompt}
-            ])
-            
-            # Collect all content from streaming responses
-            full_content = ""
-            for response in response_generator:
-                if response and hasattr(response, 'content'):
-                    full_content += response.content
-            
-            if full_content:
-                return full_content
-        except Exception as e:
-            pass
-        
-        # Return placeholder if model call fails
-        return "[Summary generation failed]"
-    
-    def _format_messages_for_summary(self, messages: List[Dict[str, Any]]) -> str:
-        """Format messages for summarization prompt."""
-        lines = []
-        for msg in messages[-30:]:  # Last 30 messages
-            role = msg.get("role", "unknown")
-            content = self._get_text_content(msg)
-            if content:
-                # Truncate long content
-                if len(content) > 500:
-                    content = content[:500] + "..."
-                lines.append(f"[{role.upper()}]: {content}")
-        return "\n\n".join(lines)
+    def _conversation_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        result = []
+        for index, message in enumerate(messages):
+            if index == 0 and message.get("role") == "system":
+                continue
+            result.append(copy.deepcopy(message))
+        if not result:
+            raise SummaryGenerationError("Summary generation failed: no messages to summarize")
+        return result
+
+    def _compression_request(self, max_tokens: int) -> str:
+        return (
+            "请总结以上对话，生成用于继续当前任务的压缩上下文摘要。"
+            f"目标长度不超过 {max_tokens} tokens。"
+            "只输出最终摘要正文，不要输出分析过程、计划、寒暄、标题或 Markdown 代码块。"
+        )
+
+    def _collect_final_summary(self, messages: List[Dict[str, Any]]) -> str:
+        full_content = ""
+        for response in self.model_connector.chat(messages):
+            self._validate_summary_response(response)
+            if response and hasattr(response, "content"):
+                full_content += response.content
+        return self._validate_final_summary(full_content)
+
+    def _validate_summary_response(self, response: Any) -> None:
+        if not response:
+            return
+        if getattr(response, "is_error", False):
+            message = getattr(response, "error_message", "") or "unknown model error"
+            raise SummaryGenerationError(f"Summary generation model error: {message}")
+        if getattr(response, "tool_calls", None):
+            raise SummaryGenerationError("Summary generation attempted tool calls")
+
+    def _validate_final_summary(self, content: str) -> str:
+        if not content or not content.strip():
+            raise SummaryGenerationError("Summary generation returned empty content")
+        return content.strip()
     
     def _get_text_content(self, message: Dict[str, Any]) -> str:
         """Extract text content from a message."""

@@ -6,6 +6,7 @@ Handles user commands in the CLI.
 """
 
 import argparse
+import shlex
 from typing import Any, Dict, List, Optional, Callable
 from pathlib import Path
 from datetime import datetime
@@ -129,6 +130,13 @@ class CommandHandler:
             description = agent.get("description") if isinstance(agent, dict) else None
             if description:
                 self.ui_renderer.print(description, style="dim")
+            payload = response.get("payload", {})
+            if payload.get("model_changed"):
+                self.ui_renderer.print_success(f"Switched to model: {payload.get('model')}")
+            elif payload.get("model_switch_failed"):
+                self.ui_renderer.print_error(
+                    f"Failed to connect to model: {payload.get('target_model')}"
+                )
         else:
             self.ui_renderer.print_error(f"Failed to switch to agent: {agent_name}")
         
@@ -453,50 +461,149 @@ class CommandHandler:
     
     def _cmd_history(self, args: str) -> bool:
         """Handle /history command."""
-        parser = argparse.ArgumentParser(prog="/history", add_help=False)
-        parser.add_argument("action", nargs="?", default="list", help="Action: list, load, search, delete, info")
-        parser.add_argument("target", nargs="?", default="", help="Session ID or search query")
-        parser.add_argument("-l", "--limit", type=int, default=10, help="Number of results")
-        parser.add_argument("-o", "--offset", type=int, default=0, help="Offset for pagination")
-        
-        parsed = self._parse_args(parser, args)
-        if parsed is None:
+        tokens = self._split_history_args(args)
+        if tokens is None:
             return True
-        
-        action = parsed.action.lower()
-        
+        if not tokens:
+            self._history_list(10, 0, "project")
+            return True
+
+        action = tokens[0].lower()
+        rest = tokens[1:]
         if action == "list":
-            self._history_list(parsed.limit, parsed.offset)
+            self._history_list_command(rest)
         elif action == "load":
-            self._history_load(parsed.target)
+            self._history_load_command(rest)
+        elif action == "save":
+            self._history_save_command(rest)
         elif action == "search":
-            self._history_search(parsed.target, parsed.limit)
+            self._history_search_command(rest)
         elif action == "delete":
-            self._history_delete(parsed.target)
+            self._history_delete_command(rest)
         elif action == "info":
-            self._history_info(parsed.target)
+            self._history_info_command(rest)
         elif action == "clear":
-            self._history_clear()
+            self._history_clear_command(rest)
+        elif len(action) == 8 and not rest:
+            self._history_load(action, "project")
         else:
-            # Try to load as session ID
-            if parsed.action and len(parsed.action) == 8:
-                self._history_load(parsed.action)
-            else:
-                self.ui_renderer.print_error(f"Unknown action: {action}")
-                self.ui_renderer.print("Usage: /history list | /history load <id> | /history search <query>", style="dim")
-        
+            self.ui_renderer.print_error(f"Unknown action: {action}")
+            self._print_history_usage()
         return True
-    
-    def _history_list(self, limit: int, offset: int) -> None:
+
+    def _split_history_args(self, args: str) -> Optional[List[str]]:
+        try:
+            tokens = shlex.split(args or "", posix=False)
+        except ValueError as exc:
+            self.ui_renderer.print_error(f"History parse error: {exc}")
+            return None
+        return [self._strip_history_quotes(token) for token in tokens]
+
+    def _strip_history_quotes(self, token: str) -> str:
+        if len(token) >= 2 and token[0] == token[-1] and token[0] in {"'", '"'}:
+            return token[1:-1]
+        return token
+
+    def _parse_history_tokens(
+        self,
+        parser: argparse.ArgumentParser,
+        tokens: List[str],
+    ) -> Optional[argparse.Namespace]:
+        try:
+            return parser.parse_args(tokens)
+        except SystemExit:
+            return None
+
+    def _history_scope(self, all_projects: bool) -> str:
+        return "all" if all_projects else "project"
+
+    def _history_list_command(self, tokens: List[str]) -> None:
+        parser = argparse.ArgumentParser(prog="/history list", add_help=False)
+        parser.add_argument("--all", "-a", action="store_true")
+        parser.add_argument("-l", "--limit", type=int, default=10)
+        parser.add_argument("-o", "--offset", type=int, default=0)
+        parsed = self._parse_history_tokens(parser, tokens)
+        if parsed:
+            self._history_list(parsed.limit, parsed.offset, self._history_scope(parsed.all))
+
+    def _history_load_command(self, tokens: List[str]) -> None:
+        if tokens and tokens[0].lower() == "path":
+            self._history_load_path_command(tokens[1:])
+            return
+        parser = argparse.ArgumentParser(prog="/history load", add_help=False)
+        parser.add_argument("session_id", nargs="?", default="")
+        parser.add_argument("--all", "-a", action="store_true")
+        parsed = self._parse_history_tokens(parser, tokens)
+        if parsed:
+            self._history_load(parsed.session_id, self._history_scope(parsed.all))
+
+    def _history_load_path_command(self, tokens: List[str]) -> None:
+        parser = argparse.ArgumentParser(prog="/history load path", add_help=False)
+        parser.add_argument("file_path", nargs="?", default="")
+        parsed = self._parse_history_tokens(parser, tokens)
+        if parsed:
+            self._history_import(parsed.file_path)
+
+    def _history_save_command(self, tokens: List[str]) -> None:
+        parser = argparse.ArgumentParser(prog="/history save", add_help=False)
+        parser.add_argument("file_path", nargs="?", default="")
+        parser.add_argument("--force", "-f", action="store_true")
+        parsed = self._parse_history_tokens(parser, tokens)
+        if parsed:
+            self._history_save(parsed.file_path, parsed.force)
+
+    def _history_search_command(self, tokens: List[str]) -> None:
+        parser = argparse.ArgumentParser(prog="/history search", add_help=False)
+        parser.add_argument("query", nargs="?", default="")
+        parser.add_argument("--all", "-a", action="store_true")
+        parser.add_argument("-l", "--limit", type=int, default=10)
+        parsed = self._parse_history_tokens(parser, tokens)
+        if parsed:
+            self._history_search(parsed.query, parsed.limit, self._history_scope(parsed.all))
+
+    def _history_delete_command(self, tokens: List[str]) -> None:
+        parser = argparse.ArgumentParser(prog="/history delete", add_help=False)
+        parser.add_argument("session_id", nargs="?", default="")
+        parser.add_argument("--all", "-a", action="store_true")
+        parsed = self._parse_history_tokens(parser, tokens)
+        if parsed:
+            self._history_delete(parsed.session_id, self._history_scope(parsed.all))
+
+    def _history_info_command(self, tokens: List[str]) -> None:
+        parser = argparse.ArgumentParser(prog="/history info", add_help=False)
+        parser.add_argument("session_id", nargs="?", default="")
+        parser.add_argument("--all", "-a", action="store_true")
+        parsed = self._parse_history_tokens(parser, tokens)
+        if parsed:
+            self._history_info(parsed.session_id, self._history_scope(parsed.all))
+
+    def _history_clear_command(self, tokens: List[str]) -> None:
+        parser = argparse.ArgumentParser(prog="/history clear", add_help=False)
+        parser.add_argument("--all", "-a", action="store_true")
+        parsed = self._parse_history_tokens(parser, tokens)
+        if parsed:
+            self._history_clear(self._history_scope(parsed.all))
+
+    def _print_history_usage(self) -> None:
+        self.ui_renderer.print(
+            "Usage: /history list | /history load <id> | /history load path <file> | /history save <file>",
+            style="dim",
+        )
+
+    def _history_list(self, limit: int, offset: int, scope: str) -> None:
         """List history sessions."""
         self.ui_renderer.print()
-        self.ui_renderer.print("[bold]Session History[/bold]")
+        title = "Session History (all projects)" if scope == "all" else "Session History (current project)"
+        self.ui_renderer.print(f"[bold]{title}[/bold]")
 
         response = self.client.request(
             "session.list",
-            {"limit": limit, "offset": offset},
+            {"limit": limit, "offset": offset, "scope": scope},
         )
-        sessions = response.get("payload", {}).get("sessions", []) if response.get("success") else []
+        if not response.get("success"):
+            self.ui_renderer.print_error(response.get("error") or "Failed to list sessions")
+            return
+        sessions = response.get("payload", {}).get("sessions", [])
 
         if not sessions:
             self.ui_renderer.print("  [dim]No sessions found.[/dim]")
@@ -519,6 +626,8 @@ class CommandHandler:
                 f"    [dim]Agent: {session.get('agent', 'build')} | Messages: {session.get('message_count', 0)}[/dim]"
             )
             self.ui_renderer.print(f"    [dim]Created: {created} | Updated: {updated}[/dim]")
+            if scope == "all":
+                self.ui_renderer.print(f"    [dim]Project: {session.get('project_path') or 'N/A'}[/dim]")
         
         # Show pagination info
         total = response.get("payload", {}).get("total", len(sessions))
@@ -529,26 +638,61 @@ class CommandHandler:
         
         self.ui_renderer.print()
         self.ui_renderer.print("[dim]Usage: /history load <id> | /history search <query>[/dim]")
-    
-    def _history_load(self, session_id: str) -> None:
+
+    def _history_load(self, session_id: str, scope: str) -> None:
         """Load a history session."""
         if not session_id:
             self.ui_renderer.print_error("Specify session ID")
-            self.ui_renderer.print("Usage: /history load <session_id>", style="dim")
+            self.ui_renderer.print("Usage: /history load <session_id> [--all]", style="dim")
             return
 
-        response = self.client.request("session.load", {"session_id": session_id})
+        response = self.client.request("session.load", {"session_id": session_id, "scope": scope})
         if response.get("success"):
-            metadata = response.get("payload", {}).get("metadata", {})
-            title = metadata.get("title") or f"Session {metadata.get('session_id', session_id)}"
+            payload = response.get("payload", {})
+            metadata = payload.get("metadata", {})
+            new_id = metadata.get("session_id") or payload.get("session_id", "")
+            title = metadata.get("title") or f"Session {new_id}"
             message_count = metadata.get("message_count", 0)
-            self.ui_renderer.print_success(f"Loaded session: {session_id}")
+            self.ui_renderer.print_success(f"Loaded session as new session: {new_id}")
+            if session_id != new_id:
+                self.ui_renderer.print(f"  Source session: {session_id}", style="dim")
             self.ui_renderer.print(f"  Title: {title}", style="dim")
             self.ui_renderer.print(f"  Messages: {message_count}", style="dim")
+            for warning in payload.get("warnings", []):
+                self.ui_renderer.print_warning(warning)
         else:
-            self.ui_renderer.print_error(f"Failed to load session: {session_id}")
-    
-    def _history_search(self, query: str, limit: int) -> None:
+            self.ui_renderer.print_error(response.get("error") or f"Failed to load session: {session_id}")
+
+    def _history_import(self, file_path: str) -> None:
+        if not file_path:
+            self.ui_renderer.print_error("Specify history file path")
+            self.ui_renderer.print("Usage: /history load path <file_path>", style="dim")
+            return
+        response = self.client.request("session.import", {"path": file_path})
+        if response.get("success"):
+            payload = response.get("payload", {})
+            self.ui_renderer.print_success(
+                f"Loaded session as new session: {payload.get('session_id', 'unknown')}"
+            )
+            self.ui_renderer.print(f"  Source path: {file_path}", style="dim")
+            for warning in payload.get("warnings", []):
+                self.ui_renderer.print_warning(warning)
+            return
+        self.ui_renderer.print_error(response.get("error") or "Failed to import history file")
+
+    def _history_save(self, file_path: str, force: bool) -> None:
+        if not file_path:
+            self.ui_renderer.print_error("Specify history file path")
+            self.ui_renderer.print("Usage: /history save <file_path> [--force]", style="dim")
+            return
+        response = self.client.request("session.export", {"path": file_path, "force": force})
+        if response.get("success"):
+            path = response.get("payload", {}).get("path", file_path)
+            self.ui_renderer.print_success(f"Saved current session: {path}")
+            return
+        self.ui_renderer.print_error(response.get("error") or "Failed to save history file")
+
+    def _history_search(self, query: str, limit: int, scope: str) -> None:
         """Search history sessions."""
         if not query:
             self.ui_renderer.print_error("Specify search query")
@@ -556,10 +700,14 @@ class CommandHandler:
             return
         
         self.ui_renderer.print()
-        self.ui_renderer.print(f"[bold]Search Results for '{query}'[/bold]")
+        scope_title = "all projects" if scope == "all" else "current project"
+        self.ui_renderer.print(f"[bold]Search Results ({scope_title}) for '{query}'[/bold]")
 
-        response = self.client.request("session.search", {"query": query, "limit": limit})
-        results = response.get("payload", {}).get("results", []) if response.get("success") else []
+        response = self.client.request("session.search", {"query": query, "limit": limit, "scope": scope})
+        if not response.get("success"):
+            self.ui_renderer.print_error(response.get("error") or "Search failed")
+            return
+        results = response.get("payload", {}).get("results", [])
 
         if not results:
             self.ui_renderer.print("  [dim]No matching sessions found.[/dim]")
@@ -573,25 +721,27 @@ class CommandHandler:
             if preview:
                 self.ui_renderer.print(f"    [dim]Preview: {preview}[/dim]")
             self.ui_renderer.print(f"    [dim]Messages: {result.get('message_count', 0)}[/dim]")
-    
-    def _history_delete(self, session_id: str) -> None:
+            if scope == "all":
+                self.ui_renderer.print(f"    [dim]Project: {result.get('project_path') or 'N/A'}[/dim]")
+
+    def _history_delete(self, session_id: str, scope: str) -> None:
         """Delete a history session."""
         if not session_id:
             self.ui_renderer.print_error("Specify session ID")
             return
 
-        response = self.client.request("session.delete", {"session_id": session_id})
+        response = self.client.request("session.delete", {"session_id": session_id, "scope": scope})
         if response.get("success"):
             self.ui_renderer.print_success(f"Deleted session: {session_id}")
         else:
             error = response.get("error") or "Failed to delete session"
             self.ui_renderer.print_error(error)
-    
-    def _history_info(self, session_id: str) -> None:
+
+    def _history_info(self, session_id: str, scope: str) -> None:
         """Show session info."""
         response = self.client.request(
             "session.info",
-            {"session_id": session_id} if session_id else {},
+            {"session_id": session_id, "scope": scope} if session_id else {},
         )
         if not response.get("success"):
             self.ui_renderer.print_error(response.get("error") or "Session not found")
@@ -605,13 +755,28 @@ class CommandHandler:
         self.ui_renderer.print(f"  Title: {info.get('title', 'N/A')}")
         self.ui_renderer.print(f"  Agent: {info.get('agent', 'N/A')}")
         self.ui_renderer.print(f"  Model: {info.get('model', 'N/A')}")
+        self.ui_renderer.print(f"  Project: {info.get('project_path') or 'N/A'}")
         self.ui_renderer.print(f"  Messages: {info.get('message_count', 0)}")
         self.ui_renderer.print(f"  Created: {info.get('created_at', 'N/A')}")
         self.ui_renderer.print(f"  Updated: {info.get('updated_at', 'N/A')}")
-    
-    def _history_clear(self) -> None:
+        self._print_history_source_info(info)
+
+    def _print_history_source_info(self, info: Dict[str, Any]) -> None:
+        if not info.get("source_kind"):
+            return
+        self.ui_renderer.print(f"  Source kind: {info.get('source_kind')}")
+        if info.get("source_session_id"):
+            self.ui_renderer.print(f"  Source session: {info.get('source_session_id')}")
+        if info.get("source_path"):
+            self.ui_renderer.print(f"  Source path: {info.get('source_path')}")
+        if info.get("source_agent") and info.get("source_agent") != info.get("agent"):
+            self.ui_renderer.print(f"  Source agent: {info.get('source_agent')}")
+        if info.get("source_model") and info.get("source_model") != info.get("model"):
+            self.ui_renderer.print(f"  Source model: {info.get('source_model')}")
+
+    def _history_clear(self, scope: str) -> None:
         """Clear all history (with confirmation)."""
-        list_resp = self.client.request("session.list", {"limit": 10000, "offset": 0})
+        list_resp = self.client.request("session.list", {"limit": 10000, "offset": 0, "scope": scope})
         sessions = list_resp.get("payload", {}).get("sessions", []) if list_resp.get("success") else []
         session_ids = [s.get("session_id") for s in sessions if isinstance(s, dict)]
         session_ids = [sid for sid in session_ids if sid]
@@ -628,15 +793,16 @@ class CommandHandler:
         if not deletable_ids:
             self.ui_renderer.print("No sessions to clear (current session is active)", style="dim")
             return
-        
-        if not self.ui_renderer.confirm_history_clear(len(deletable_ids)):
+
+        scope_label = "all projects" if scope == "all" else "current project"
+        if not self.ui_renderer.confirm_history_clear(len(deletable_ids), scope_label):
             self.ui_renderer.print("Operation cancelled", style="dim")
             return
         
         deleted = 0
         failed = 0
         for session_id in deletable_ids:
-            resp = self.client.request("session.delete", {"session_id": session_id})
+            resp = self.client.request("session.delete", {"session_id": session_id, "scope": scope})
             if resp.get("success"):
                 deleted += 1
             else:
@@ -831,6 +997,7 @@ class CommandHandler:
             # Messages count
             msg_count = usage.get("message_count", 0)
             self.ui_renderer.print(f"  Messages: {msg_count}")
+            self._print_session_token_usage(usage)
             
             # Warning if approaching limit
             if usage.get('should_compact'):
@@ -864,6 +1031,22 @@ class CommandHandler:
             self.ui_renderer.print("Usage: /context status | stats | clear", style="dim")
         
         return True
+
+    def _print_session_token_usage(self, usage: dict) -> None:
+        self.ui_renderer.print()
+        self.ui_renderer.print("[bold]Session Token Usage[/bold]")
+        self.ui_renderer.print(f"  Input tokens: {usage.get('session_input_tokens', 0):,}")
+        self.ui_renderer.print(f"  Output tokens: {usage.get('session_output_tokens', 0):,}")
+        self.ui_renderer.print(f"  Total tokens: {usage.get('session_total_tokens', 0):,}")
+
+        last_usage = usage.get("last_request_usage")
+        if last_usage:
+            self.ui_renderer.print(
+                "  Last request: "
+                f"input {last_usage.get('input_tokens', 0):,} / "
+                f"output {last_usage.get('output_tokens', 0):,} / "
+                f"total {last_usage.get('total_tokens', 0):,}"
+            )
     
     def _cmd_permission(self, args: str) -> bool:
         """Handle /permission command."""
@@ -924,7 +1107,91 @@ class CommandHandler:
             self.ui_renderer.print("Usage: /permission status | grant <type> | revoke <type> | clear", style="dim")
         
         return True
-    
+
+    def _cmd_sandbox(self, args: str) -> bool:
+        """Handle /sandbox command."""
+        parser = argparse.ArgumentParser(prog="/sandbox", add_help=False)
+        parser.add_argument("action", nargs="?", default="status", help="Action: status, on, off, reload")
+
+        parsed = self._parse_args(parser, args)
+        if parsed is None:
+            return True
+
+        action = parsed.action.lower()
+        if action == "status":
+            response = self.client.request("sandbox.status", {})
+        elif action == "on":
+            response = self.client.request("sandbox.enable", {})
+        elif action == "off":
+            response = self.client.request("sandbox.disable", {})
+        elif action == "reload":
+            response = self.client.request("sandbox.reload", {})
+        else:
+            self.ui_renderer.print_error(f"Unknown action: {action}")
+            self.ui_renderer.print("Usage: /sandbox status | on | off | reload", style="dim")
+            return True
+
+        if not response.get("success"):
+            self.ui_renderer.print_error(response.get("error") or "Sandbox command failed")
+            return True
+
+        self._render_sandbox_status(response.get("payload", {}))
+        return True
+
+    def _render_sandbox_status(self, status: Dict[str, Any]) -> None:
+        """Render sandbox status in the CLI."""
+        enabled = bool(status.get("enabled", False))
+        provider = status.get("provider") or {}
+        provider_type = provider.get("type", "unknown")
+        provider_name = provider.get("name") or provider.get("module") or provider.get("command")
+        self.ui_renderer.print()
+        self.ui_renderer.print("[bold]Sandbox Status[/bold]")
+        self.ui_renderer.print(f"  Enabled: {'[green]Yes[/green]' if enabled else '[dim]No[/dim]'}")
+        self.ui_renderer.print(f"  Provider: [cyan]{provider_type}[/cyan] {provider_name or ''}")
+        self.ui_renderer.print(f"  Unknown mutation: {status.get('unknown_mutation', 'allow')}")
+        self.ui_renderer.print(f"  Workspace: {status.get('workspace_root', 'N/A')}", style="dim")
+
+    def _cmd_hook(self, args: str) -> bool:
+        """Handle /hook command."""
+        action = (args or "status").strip().lower()
+        if action != "status":
+            self.ui_renderer.print_error(f"Unknown action: {action}")
+            self.ui_renderer.print("Usage: /hook status", style="dim")
+            return True
+        response = self.client.request("hook.status", {})
+        if not response.get("success"):
+            self.ui_renderer.print_error(response.get("error") or "Hook status failed")
+            return True
+        self._render_hook_status(response.get("payload", {}))
+        return True
+
+    def _render_hook_status(self, status: Dict[str, Any]) -> None:
+        hooks = status.get("hooks") or []
+        enabled = bool(status.get("enabled", True))
+        self.ui_renderer.print()
+        self.ui_renderer.print("[bold]Hook Status[/bold]")
+        self.ui_renderer.print(f"  Enabled: {'[green]Yes[/green]' if enabled else '[dim]No[/dim]'}")
+        self.ui_renderer.print(f"  Loaded hooks: {sum(1 for item in hooks if item.get('status') == 'loaded')}")
+        if not hooks:
+            self.ui_renderer.print("  [dim]No hooks configured.[/dim]")
+            return
+        for item in hooks:
+            self._render_hook_item(item)
+
+    def _render_hook_item(self, item: Dict[str, Any]) -> None:
+        scope = item.get("scope") or {}
+        tools = scope.get("tool_names") or []
+        self.ui_renderer.print()
+        self.ui_renderer.print(f"  [cyan]{item.get('id', 'unknown')}[/cyan]")
+        self.ui_renderer.print(f"    Event: {item.get('event') or 'N/A'}")
+        self.ui_renderer.print(f"    Type: {item.get('type') or 'N/A'}")
+        self.ui_renderer.print(f"    Priority: {item.get('priority', 0)}")
+        self.ui_renderer.print(f"    Timeout: {item.get('timeout_seconds', 0)}s")
+        self.ui_renderer.print(f"    Scope: {', '.join(scope.get('sources') or [])}")
+        if tools:
+            self.ui_renderer.print(f"    Tools: {', '.join(tools)}")
+        self.ui_renderer.print(f"    Status: {item.get('status', 'unknown')}")
+
     def _cmd_exit(self, args: str) -> bool:
         """Handle /exit command."""
         self.ui_renderer.print("Goodbye!", style="dim")

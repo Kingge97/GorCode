@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 
 from ..utils.serialization import dataclass_from_dict, dataclass_to_dict
+from ..context.compression import default_compression_settings_dict
+from ..hooks.config import default_hook_settings_dict, merge_hook_settings
 import copy
 
 
@@ -77,6 +79,20 @@ class GorCodeConfig:
 
     # Permission settings (optional overrides)
     permission_settings: Dict[str, Any] = field(default_factory=dict)
+
+    # Sandbox settings (optional overrides)
+    sandbox_settings: Dict[str, Any] = field(default_factory=dict)
+
+    # Compression settings
+    compression_settings: Dict[str, Any] = field(
+        default_factory=default_compression_settings_dict
+    )
+
+    # GorCode application hook settings
+    hook_settings: Dict[str, Any] = field(default_factory=default_hook_settings_dict)
+
+    # Tracks whether a loaded config file explicitly contained hook settings.
+    _hook_settings_present: bool = field(default=False, repr=False, compare=False)
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -87,6 +103,7 @@ class GorCodeConfig:
                     name: conn.to_dict() for name, conn in (value or {}).items()
                 },
             },
+            exclude_fields={"_hook_settings_present"},
         )
     
     @classmethod
@@ -99,8 +116,15 @@ class GorCodeConfig:
             payload["file_tool_settings"] = payload.get("fileToolSettings")
         if not payload.get("permission_settings") and payload.get("permissionSettings"):
             payload["permission_settings"] = payload.get("permissionSettings")
+        if not payload.get("sandbox_settings") and payload.get("sandboxSettings"):
+            payload["sandbox_settings"] = payload.get("sandboxSettings")
+        if not payload.get("compression_settings") and payload.get("compressionSettings"):
+            payload["compression_settings"] = payload.get("compressionSettings")
+        hook_settings_present = "hook_settings" in payload or "hookSettings" in payload
+        if not payload.get("hook_settings") and payload.get("hookSettings"):
+            payload["hook_settings"] = payload.get("hookSettings")
 
-        return dataclass_from_dict(
+        config = dataclass_from_dict(
             cls,
             payload,
             field_deserializers={
@@ -110,6 +134,8 @@ class GorCodeConfig:
                 }
             },
         )
+        config._hook_settings_present = hook_settings_present
+        return config
 
 
 class ConfigManager:
@@ -292,6 +318,20 @@ class ConfigManager:
             if result.permission_settings is None:
                 result.permission_settings = {}
             result.permission_settings.update(override.permission_settings)
+        if override.sandbox_settings:
+            if result.sandbox_settings is None:
+                result.sandbox_settings = {}
+            result.sandbox_settings.update(override.sandbox_settings)
+        if override.compression_settings:
+            if result.compression_settings is None:
+                result.compression_settings = {}
+            result.compression_settings.update(override.compression_settings)
+        if override._hook_settings_present:
+            result.hook_settings = merge_hook_settings(
+                result.hook_settings,
+                override.hook_settings,
+                override_present=True,
+            )
 
         return result
     

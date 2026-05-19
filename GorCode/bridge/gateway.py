@@ -6,6 +6,7 @@ Backend service that exposes protocol-based requests and event streams.
 """
 
 from typing import Any, Dict, Generator, Iterable, List, Optional
+from pathlib import Path
 import queue
 import threading
 import asyncio
@@ -20,8 +21,22 @@ from GorCode.backend.agents.base import AgentRegistry
 from GorCode.backend.permission import get_permission_manager, PermissionType
 from GorCode.backend.mcp import MCPManager, create_mcp_tools
 from GorCode.backend.skills import SkillLoader, SkillInjector
+from GorCode.backend.session import Session, SessionCloneError
 
 from .protocol import make_event, make_response
+
+
+ERROR_SESSION_EXISTS_OUTSIDE_PROJECT = "SESSION_EXISTS_OUTSIDE_PROJECT"
+ERROR_SESSION_MANAGER_UNAVAILABLE = "SESSION_MANAGER_UNAVAILABLE"
+ERROR_SESSION_NOT_FOUND = "SESSION_NOT_FOUND"
+ERROR_HISTORY_FILE_EXISTS = "HISTORY_FILE_EXISTS"
+ERROR_HISTORY_FILE_NOT_FOUND = "HISTORY_FILE_NOT_FOUND"
+ERROR_HISTORY_FILE_INVALID = "HISTORY_FILE_INVALID"
+ERROR_HISTORY_FILE_ENCODING_INVALID = "HISTORY_FILE_ENCODING_INVALID"
+ERROR_HISTORY_PARENT_DIR_NOT_FOUND = "HISTORY_PARENT_DIR_NOT_FOUND"
+ERROR_HISTORY_SAVE_FAILED = "HISTORY_SAVE_FAILED"
+ERROR_HISTORY_IMPORT_FAILED = "HISTORY_IMPORT_FAILED"
+ERROR_CURRENT_SESSION_SAVE_FAILED = "CURRENT_SESSION_SAVE_FAILED"
 
 
 EVENT_TYPE_TO_PROTOCOL = {
@@ -126,6 +141,16 @@ class BackendService:
             task_tool.set_permission_manager(self._executor._permission_manager)
         if hasattr(task_tool, "set_permission_callback"):
             task_tool.set_permission_callback(self._executor._permission_callback)
+        if hasattr(task_tool, "set_sandbox_manager"):
+            task_tool.set_sandbox_manager(self._executor.sandbox_manager)
+        if hasattr(task_tool, "set_hook_runtime"):
+            task_tool.set_hook_runtime(self._executor.hook_runtime)
+        if hasattr(task_tool, "set_hook_run_context"):
+            task_tool.set_hook_run_context(
+                self._executor.state.current_run_id,
+                self._get_session_id(),
+                self._executor.state.current_model,
+            )
 
     def _subscribe_bus_events(self) -> None:
         for event_type in FORWARDED_BUS_EVENTS:
@@ -167,6 +192,492 @@ class BackendService:
 
     def _get_debug_logger(self):
         return getattr(self._executor, "_debug_logger", None)
+
+    def _get_agent_target_model(self, agent: str) -> Optional[str]:
+        config_manager = self._get_config_manager()
+        if not config_manager:
+            return None
+        connection = config_manager.get_agent_model(agent)
+        return connection.name if connection else None
+
+    def _error_response(
+        self,
+        request_id: str,
+        error: str,
+        error_code: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        data = dict(payload or {})
+        data["error_code"] = error_code
+        return make_response(
+            request_id,
+            payload=data,
+            session_id=self._get_session_id(),
+            success=False,
+            error=error,
+        )
+
+    def _session_manager_error(self, request_id: str) -> Dict[str, Any]:
+        return self._error_response(
+            request_id,
+            "Session manager not available",
+            ERROR_SESSION_MANAGER_UNAVAILABLE,
+        )
+
+    def _history_scope(self, payload: Dict[str, Any]) -> str:
+        scope = str(payload.get("scope", "project") or "project").strip().lower()
+        return "all" if scope == "all" else "project"
+
+    def _session_not_found_response(
+        self,
+        request_id: str,
+        action: str,
+        session_id: str,
+        scope: str,
+    ) -> Dict[str, Any]:
+        manager = self._get_session_manager()
+        outside = scope == "project" and manager.storage.exists_outside_project(
+            session_id,
+            manager.project_path,
+        )
+        if outside:
+            return self._outside_project_response(request_id, action, session_id)
+        return self._error_response(
+            request_id,
+            f"Session not found: {session_id}",
+            ERROR_SESSION_NOT_FOUND,
+        )
+
+    def _outside_project_response(
+        self,
+        request_id: str,
+        action: str,
+        session_id: str,
+    ) -> Dict[str, Any]:
+        command = f"/history {action} {session_id} --all"
+        error = (
+            f"Session not found in current project: {session_id}\n"
+            f"A matching session exists outside this project. Use {command} to {action} it."
+        )
+        return self._error_response(
+            request_id,
+            error,
+            ERROR_SESSION_EXISTS_OUTSIDE_PROJECT,
+        )
+
+    def _history_agent_allowed(self, agent: str) -> bool:
+        registry = getattr(self._executor, "_agent_registry", None)
+        return bool(agent and registry and registry.get(agent))
+
+    def _history_model_allowed(self, model: str) -> bool:
+        model_manager = getattr(self._executor, "_model_manager", None)
+        if model and model_manager:
+            return model in model_manager.list_models()
+        config_manager = self._get_config_manager()
+        if model and config_manager:
+            return model in config_manager.list_available_models()
+        return False
+
+    def _history_runtime_choice(self, source: Session) -> Dict[str, Any]:
+        current_agent = self._executor.state.current_agent
+        current_model = self._executor.state.current_model
+        source_agent = str(source.metadata.agent or "").strip().lower()
+        source_model = str(source.metadata.model or "").strip().lower()
+        warnings: List[str] = []
+        agent = self._choose_history_agent(source_agent, current_agent, warnings)
+        model = self._choose_history_model(source_model, current_model, warnings)
+        return {"agent": agent, "model": model, "warnings": warnings}
+
+    def _choose_history_agent(
+        self,
+        source_agent: str,
+        current_agent: str,
+        warnings: List[str],
+    ) -> str:
+        if not source_agent or self._history_agent_allowed(source_agent):
+            return source_agent or current_agent
+        warnings.append(f"history agent is not allowed, use current agent {current_agent}")
+        return current_agent
+
+    def _choose_history_model(
+        self,
+        source_model: str,
+        current_model: str,
+        warnings: List[str],
+    ) -> str:
+        if not source_model or self._history_model_allowed(source_model):
+            return source_model or current_model
+        warnings.append(f"history model is not allowed, use current model {current_model}")
+        return current_model
+
+    def _apply_history_runtime(
+        self,
+        agent: str,
+        model: str,
+        warnings: List[str],
+    ) -> Dict[str, str]:
+        actual_agent = self._apply_history_agent(agent, warnings)
+        actual_model = self._apply_history_model(model, warnings)
+        self._sync_task_tool()
+        return {"agent": actual_agent, "model": actual_model}
+
+    def _apply_history_agent(self, agent: str, warnings: List[str]) -> str:
+        current = self._executor.state.current_agent
+        if not agent or agent == current:
+            return current
+        if self._executor.switch_agent(agent):
+            return self._executor.state.current_agent
+        warnings.append(f"history agent is not allowed, use current agent {current}")
+        return current
+
+    def _apply_history_model(self, model: str, warnings: List[str]) -> str:
+        current = self._executor.state.current_model
+        if not model or model == current:
+            return current
+        if self._executor.switch_model(model):
+            return self._executor.state.current_model
+        warnings.append(f"history model is not allowed, use current model {current}")
+        return current
+
+    def _clone_history_session(
+        self,
+        request_id: str,
+        source_session: Session,
+        source: Dict[str, str],
+    ) -> Dict[str, Any]:
+        manager = self._get_session_manager()
+        runtime = self._history_runtime_choice(source_session)
+        try:
+            clone = manager.clone_session_for_current_project(
+                source_session,
+                source,
+                agent=runtime["agent"],
+                model=runtime["model"],
+            )
+        except SessionCloneError as exc:
+            return self._clone_error_response(request_id, str(exc), source)
+        actual = self._apply_history_runtime(
+            runtime["agent"],
+            runtime["model"],
+            runtime["warnings"],
+        )
+        return self._finish_history_clone(request_id, clone, source, actual, runtime["warnings"])
+
+    def _clone_error_response(
+        self,
+        request_id: str,
+        error: str,
+        source: Dict[str, str],
+    ) -> Dict[str, Any]:
+        code = ERROR_HISTORY_IMPORT_FAILED
+        if "current session" in error.lower():
+            code = ERROR_CURRENT_SESSION_SAVE_FAILED
+        return self._error_response(request_id, error, code, payload={"source": source})
+
+    def _finish_history_clone(
+        self,
+        request_id: str,
+        clone: Session,
+        source: Dict[str, str],
+        actual: Dict[str, str],
+        warnings: List[str],
+    ) -> Dict[str, Any]:
+        manager = self._get_session_manager()
+        self._sync_clone_state(clone, actual)
+        if not manager.save_current_session():
+            return self._error_response(
+                request_id,
+                "Failed to save cloned session",
+                ERROR_HISTORY_SAVE_FAILED,
+            )
+        self._start_clone_debug_session(clone, actual["agent"])
+        return make_response(
+            request_id,
+            payload=self._clone_payload(clone, source, warnings),
+            session_id=self._get_session_id(),
+        )
+
+    def _sync_clone_state(self, clone: Session, actual: Dict[str, str]) -> None:
+        manager = self._get_session_manager()
+        manager.update_agent(actual["agent"])
+        manager.update_model(actual["model"])
+        self._executor.state.messages = clone.get_messages_for_model()
+        self._executor.reset_token_usage()
+
+    def _start_clone_debug_session(self, clone: Session, agent: str) -> None:
+        debug_logger = self._get_debug_logger()
+        if debug_logger and debug_logger.enabled:
+            debug_logger.end_session()
+            debug_logger.start_session(agent, clone.session_id)
+
+    def _clone_payload(
+        self,
+        clone: Session,
+        source: Dict[str, str],
+        warnings: List[str],
+    ) -> Dict[str, Any]:
+        return {
+            "success": True,
+            "session_id": clone.session_id,
+            "source_session_id": source.get("session_id", ""),
+            "source_path": source.get("path", ""),
+            "messages": clone.get_messages_for_model(),
+            "metadata": clone.metadata.to_dict(),
+            "warnings": list(warnings),
+        }
+
+    def _resolve_history_path(self, path_value: str) -> Path:
+        path = Path(str(path_value or "").strip()).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        return path.resolve(strict=False)
+
+    def _load_session_from_history_file(self, path: Path) -> Session:
+        try:
+            with open(path, "r", encoding="utf-8") as file:
+                data = json.load(file)
+        except UnicodeDecodeError as exc:
+            raise ValueError(ERROR_HISTORY_FILE_ENCODING_INVALID) from exc
+        except json.JSONDecodeError as exc:
+            raise ValueError(ERROR_HISTORY_FILE_INVALID) from exc
+        except OSError as exc:
+            raise ValueError(ERROR_HISTORY_FILE_INVALID) from exc
+        self._validate_history_file_payload(data)
+        return Session.from_dict(data)
+
+    def _validate_history_file_payload(self, data: Any) -> None:
+        if not isinstance(data, dict):
+            raise ValueError(ERROR_HISTORY_FILE_INVALID)
+        if "metadata" not in data or "messages" not in data:
+            raise ValueError(ERROR_HISTORY_FILE_INVALID)
+        if not isinstance(data.get("metadata"), dict):
+            raise ValueError(ERROR_HISTORY_FILE_INVALID)
+        self._validate_history_messages(data.get("messages"))
+
+    def _validate_history_messages(self, messages: Any) -> None:
+        if not isinstance(messages, list):
+            raise ValueError(ERROR_HISTORY_FILE_INVALID)
+        for message in messages:
+            if not isinstance(message, dict):
+                raise ValueError(ERROR_HISTORY_FILE_INVALID)
+            if "role" not in message or "content" not in message:
+                raise ValueError(ERROR_HISTORY_FILE_INVALID)
+
+    def _handle_session_load(
+        self,
+        request_id: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        manager = self._get_session_manager()
+        if not manager:
+            return self._session_manager_error(request_id)
+        session_id = str(payload.get("session_id", "")).strip()
+        if not session_id:
+            return self._handle_legacy_session_load(request_id, payload)
+        scope = self._history_scope(payload)
+        session = manager.storage.load_scoped(session_id, scope, manager.project_path)
+        if not session:
+            return self._session_not_found_response(request_id, "load", session_id, scope)
+        source = {"kind": "session_id", "session_id": session_id, "path": ""}
+        return self._clone_history_session(request_id, session, source)
+
+    def _handle_legacy_session_load(
+        self,
+        request_id: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        messages = payload.get("messages")
+        if messages is None:
+            return self._error_response(
+                request_id,
+                "Session ID is required",
+                ERROR_SESSION_NOT_FOUND,
+            )
+        self._executor.load_messages(messages or [])
+        agent = payload.get("agent")
+        model = payload.get("model")
+        if agent:
+            self._executor.switch_agent(str(agent).strip().lower())
+            self._sync_task_tool()
+        if model:
+            self._executor.switch_model(str(model).strip().lower())
+        return make_response(
+            request_id,
+            payload={"success": True},
+            session_id=self._get_session_id(),
+        )
+
+    def _handle_session_save(self, request_id: str) -> Dict[str, Any]:
+        success = self._executor.save_current_session()
+        return make_response(
+            request_id,
+            payload={"success": success},
+            session_id=self._get_session_id(),
+            success=success,
+            error=None if success else "Failed to save session",
+        )
+
+    def _handle_session_list(
+        self,
+        request_id: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        manager = self._get_session_manager()
+        if not manager:
+            return self._session_manager_error(request_id)
+        limit = int(payload.get("limit", 20) or 20)
+        offset = int(payload.get("offset", 0) or 0)
+        sort_by = str(payload.get("sort_by", "updated_at") or "updated_at")
+        scope = self._history_scope(payload)
+        sessions = manager.list_sessions(limit, offset, sort_by, scope=scope)
+        return make_response(
+            request_id,
+            payload={
+                "sessions": [session.to_dict() for session in sessions],
+                "total": manager.get_session_count(scope=scope),
+                "scope": scope,
+            },
+            session_id=self._get_session_id(),
+        )
+
+    def _handle_session_search(
+        self,
+        request_id: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        manager = self._get_session_manager()
+        if not manager:
+            return self._session_manager_error(request_id)
+        query = str(payload.get("query", "")).strip()
+        if not query:
+            return self._error_response(
+                request_id,
+                "Search query is required",
+                ERROR_HISTORY_FILE_INVALID,
+            )
+        limit = int(payload.get("limit", 10) or 10)
+        scope = self._history_scope(payload)
+        results = manager.search_sessions(query, limit, scope=scope)
+        return make_response(
+            request_id,
+            payload={"results": [result.to_dict() for result in results], "scope": scope},
+            session_id=self._get_session_id(),
+        )
+
+    def _handle_session_delete(
+        self,
+        request_id: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        manager = self._get_session_manager()
+        if not manager:
+            return self._session_manager_error(request_id)
+        session_id = str(payload.get("session_id", "")).strip()
+        if not session_id:
+            return self._error_response(request_id, "Session ID is required", ERROR_SESSION_NOT_FOUND)
+        if manager.current_session and manager.current_session.session_id == session_id:
+            return self._error_response(request_id, "Cannot delete current session", ERROR_SESSION_NOT_FOUND)
+        scope = self._history_scope(payload)
+        if not manager.storage.load_scoped(session_id, scope, manager.project_path):
+            return self._session_not_found_response(request_id, "delete", session_id, scope)
+        success = manager.delete_session(session_id, scope=scope)
+        return make_response(
+            request_id,
+            payload={"success": success},
+            session_id=self._get_session_id(),
+            success=success,
+            error=None if success else "Failed to delete session",
+        )
+
+    def _handle_session_info(
+        self,
+        request_id: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        manager = self._get_session_manager()
+        if not manager:
+            return self._session_manager_error(request_id)
+        session_id = str(payload.get("session_id", "")).strip()
+        if not session_id:
+            session = manager.current_session
+        else:
+            scope = self._history_scope(payload)
+            session = manager.storage.load_scoped(session_id, scope, manager.project_path)
+            if not session:
+                return self._session_not_found_response(request_id, "info", session_id, scope)
+        if not session:
+            return self._error_response(request_id, "Session not found", ERROR_SESSION_NOT_FOUND)
+        return make_response(
+            request_id,
+            payload={"metadata": session.metadata.to_dict()},
+            session_id=self._get_session_id(),
+        )
+
+    def _handle_session_export(
+        self,
+        request_id: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        manager = self._get_session_manager()
+        if not manager:
+            return self._session_manager_error(request_id)
+        path_value = str(payload.get("path", "")).strip()
+        if not path_value:
+            return self._error_response(request_id, "History file path is required", ERROR_HISTORY_FILE_INVALID)
+        path = self._resolve_history_path(path_value)
+        if not path.parent.exists():
+            return self._error_response(request_id, f"Parent directory not found: {path.parent}", ERROR_HISTORY_PARENT_DIR_NOT_FOUND)
+        if path.exists() and not bool(payload.get("force", False)):
+            return self._error_response(request_id, f"History file already exists: {path}", ERROR_HISTORY_FILE_EXISTS)
+        if not manager.save_current_session():
+            return self._error_response(request_id, "Failed to save current session", ERROR_CURRENT_SESSION_SAVE_FAILED)
+        try:
+            with open(path, "w", encoding="utf-8") as file:
+                json.dump(manager.current_session.to_dict(), file, indent=2, ensure_ascii=False)
+        except OSError as exc:
+            return self._error_response(request_id, f"Failed to save history file: {exc}", ERROR_HISTORY_SAVE_FAILED)
+        return make_response(
+            request_id,
+            payload={"success": True, "path": str(path)},
+            session_id=self._get_session_id(),
+        )
+
+    def _handle_session_import(
+        self,
+        request_id: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        manager = self._get_session_manager()
+        if not manager:
+            return self._session_manager_error(request_id)
+        path_value = str(payload.get("path", "")).strip()
+        if not path_value:
+            return self._error_response(request_id, "History file path is required", ERROR_HISTORY_FILE_INVALID)
+        path = self._resolve_history_path(path_value)
+        if not path.exists():
+            return self._error_response(request_id, f"History file not found: {path}", ERROR_HISTORY_FILE_NOT_FOUND)
+        try:
+            source_session = self._load_session_from_history_file(path)
+        except ValueError as exc:
+            return self._history_file_error_response(request_id, str(exc), path)
+        source = {"kind": "file_path", "session_id": "", "path": str(path)}
+        return self._clone_history_session(request_id, source_session, source)
+
+    def _history_file_error_response(
+        self,
+        request_id: str,
+        code: str,
+        path: Path,
+    ) -> Dict[str, Any]:
+        error_code = code if code in {
+            ERROR_HISTORY_FILE_ENCODING_INVALID,
+            ERROR_HISTORY_FILE_INVALID,
+        } else ERROR_HISTORY_FILE_INVALID
+        return self._error_response(
+            request_id,
+            f"Invalid history file: {path}",
+            error_code,
+        )
 
     def _init_result_payload(self, result) -> Dict[str, Any]:
         if hasattr(result, "to_dict"):
@@ -396,7 +907,10 @@ class BackendService:
 
             if request_type == "agent.switch":
                 agent = str(payload.get("name") or payload.get("agent") or "").strip().lower()
+                previous_model = self._executor.state.current_model
+                target_model = self._get_agent_target_model(agent)
                 success = self._executor.switch_agent(agent)
+                current_model = self._executor.state.current_model
                 if success:
                     self._sync_task_tool()
                 return make_response(
@@ -404,6 +918,12 @@ class BackendService:
                     payload={
                         "success": success,
                         "agent": self._executor.state.current_agent,
+                        "model": current_model,
+                        "target_model": target_model,
+                        "model_changed": success and current_model != previous_model,
+                        "model_switch_failed": success
+                        and bool(target_model)
+                        and current_model != target_model,
                     },
                     session_id=self._get_session_id(),
                     success=success,
@@ -414,6 +934,9 @@ class BackendService:
                 agent = str(payload.get("agent", "")).strip()
                 if agent:
                     self._executor.state.current_agent = agent
+                    manager = self._get_session_manager()
+                    if manager:
+                        manager.update_agent(agent)
                     self._sync_task_tool()
                     return make_response(
                         request_id,
@@ -476,6 +999,7 @@ class BackendService:
                     self._executor.reset_messages()
 
                 self._executor.state.messages = []
+                self._executor.reset_token_usage()
 
                 debug_logger = self._get_debug_logger()
                 if debug_logger and debug_logger.enabled and session_id:
@@ -493,182 +1017,28 @@ class BackendService:
                 )
 
             if request_type == "session.load":
-                session_id = str(payload.get("session_id", "")).strip()
-                if session_id:
-                    session_manager = self._get_session_manager()
-                    if not session_manager:
-                        return make_response(
-                            request_id,
-                            payload={},
-                            session_id=self._get_session_id(),
-                            success=False,
-                            error="Session manager not available",
-                        )
-                    session = session_manager.load_session(session_id)
-                    if not session:
-                        return make_response(
-                            request_id,
-                            payload={},
-                            session_id=self._get_session_id(),
-                            success=False,
-                            error=f"Session not found: {session_id}",
-                        )
-                    self._executor.state.messages = session.get_messages_for_model()
-                    agent = session.metadata.agent
-                    model = session.metadata.model
-                    if agent:
-                        self._executor.switch_agent(str(agent).strip().lower())
-                        self._sync_task_tool()
-                    if model:
-                        self._executor.switch_model(str(model).strip().lower())
-
-                    debug_logger = self._get_debug_logger()
-                    if debug_logger and debug_logger.enabled:
-                        debug_logger.end_session()
-                        debug_logger.start_session(agent or self._executor.state.current_agent, session_id)
-
-                    return make_response(
-                        request_id,
-                        payload={
-                            "success": True,
-                            "messages": session.get_messages_for_model(),
-                            "metadata": session.metadata.to_dict(),
-                        },
-                        session_id=self._get_session_id(),
-                    )
-
-                # Legacy payload: load provided messages
-                messages = payload.get("messages") or []
-                agent = payload.get("agent")
-                model = payload.get("model")
-                self._executor.load_messages(messages)
-                if agent:
-                    self._executor.switch_agent(str(agent).strip().lower())
-                    self._sync_task_tool()
-                if model:
-                    self._executor.switch_model(str(model).strip().lower())
-                return make_response(
-                    request_id,
-                    payload={"success": True},
-                    session_id=self._get_session_id(),
-                )
+                return self._handle_session_load(request_id, payload)
 
             if request_type == "session.save":
-                success = self._executor.save_current_session()
-                return make_response(
-                    request_id,
-                    payload={"success": success},
-                    session_id=self._get_session_id(),
-                    success=success,
-                    error=None if success else "Failed to save session",
-                )
+                return self._handle_session_save(request_id)
 
             if request_type == "session.list":
-                session_manager = self._get_session_manager()
-                if not session_manager:
-                    return make_response(
-                        request_id,
-                        payload={"sessions": [], "total": 0},
-                        session_id=self._get_session_id(),
-                        success=False,
-                        error="Session manager not available",
-                    )
-                limit = int(payload.get("limit", 20) or 20)
-                offset = int(payload.get("offset", 0) or 0)
-                sort_by = str(payload.get("sort_by", "updated_at") or "updated_at")
-                sessions = session_manager.list_sessions(limit=limit, offset=offset, sort_by=sort_by)
-                return make_response(
-                    request_id,
-                    payload={
-                        "sessions": [s.to_dict() for s in sessions],
-                        "total": session_manager.get_session_count(),
-                    },
-                    session_id=self._get_session_id(),
-                )
+                return self._handle_session_list(request_id, payload)
 
             if request_type == "session.search":
-                session_manager = self._get_session_manager()
-                if not session_manager:
-                    return make_response(
-                        request_id,
-                        payload={"results": []},
-                        session_id=self._get_session_id(),
-                        success=False,
-                        error="Session manager not available",
-                    )
-                query = str(payload.get("query", "")).strip()
-                limit = int(payload.get("limit", 10) or 10)
-                results = session_manager.search_sessions(query, limit)
-                return make_response(
-                    request_id,
-                    payload={"results": [r.to_dict() for r in results]},
-                    session_id=self._get_session_id(),
-                )
+                return self._handle_session_search(request_id, payload)
 
             if request_type == "session.delete":
-                session_manager = self._get_session_manager()
-                if not session_manager:
-                    return make_response(
-                        request_id,
-                        payload={},
-                        session_id=self._get_session_id(),
-                        success=False,
-                        error="Session manager not available",
-                    )
-                session_id = str(payload.get("session_id", "")).strip()
-                if not session_id:
-                    return make_response(
-                        request_id,
-                        payload={},
-                        session_id=self._get_session_id(),
-                        success=False,
-                        error="Session ID is required",
-                    )
-                if session_manager.current_session and session_manager.current_session.session_id == session_id:
-                    return make_response(
-                        request_id,
-                        payload={"success": False},
-                        session_id=self._get_session_id(),
-                        success=False,
-                        error="Cannot delete current session",
-                    )
-                success = session_manager.delete_session(session_id)
-                return make_response(
-                    request_id,
-                    payload={"success": success},
-                    session_id=self._get_session_id(),
-                    success=success,
-                    error=None if success else "Failed to delete session",
-                )
+                return self._handle_session_delete(request_id, payload)
 
             if request_type == "session.info":
-                session_manager = self._get_session_manager()
-                if not session_manager:
-                    return make_response(
-                        request_id,
-                        payload={},
-                        session_id=self._get_session_id(),
-                        success=False,
-                        error="Session manager not available",
-                    )
-                session_id = str(payload.get("session_id", "")).strip()
-                if session_id:
-                    session = session_manager.storage.load(session_id)
-                else:
-                    session = session_manager.current_session
-                if not session:
-                    return make_response(
-                        request_id,
-                        payload={},
-                        session_id=self._get_session_id(),
-                        success=False,
-                        error="Session not found",
-                    )
-                return make_response(
-                    request_id,
-                    payload={"metadata": session.metadata.to_dict()},
-                    session_id=self._get_session_id(),
-                )
+                return self._handle_session_info(request_id, payload)
+
+            if request_type == "session.export":
+                return self._handle_session_export(request_id, payload)
+
+            if request_type == "session.import":
+                return self._handle_session_import(request_id, payload)
 
             if request_type == "context.status":
                 usage = self._executor.get_token_usage()
@@ -730,7 +1100,39 @@ class BackendService:
                 display = {perm.value: granted for perm, granted in permissions.items()}
                 return make_response(
                     request_id,
-                    payload={"permissions": display},
+                    payload={
+                        "permissions": display,
+                        "sandbox": self._executor.get_sandbox_status(),
+                    },
+                    session_id=self._get_session_id(),
+                )
+
+            if request_type == "sandbox.status":
+                return make_response(
+                    request_id,
+                    payload=self._executor.get_sandbox_status(),
+                    session_id=self._get_session_id(),
+                )
+
+            if request_type == "hook.status":
+                return make_response(
+                    request_id,
+                    payload=self._executor.get_hook_status(),
+                    session_id=self._get_session_id(),
+                )
+
+            if request_type in {"sandbox.enable", "sandbox.disable"}:
+                enabled = request_type == "sandbox.enable"
+                return make_response(
+                    request_id,
+                    payload=self._executor.set_sandbox_enabled(enabled),
+                    session_id=self._get_session_id(),
+                )
+
+            if request_type == "sandbox.reload":
+                return make_response(
+                    request_id,
+                    payload=self._executor.reload_sandbox(),
                     session_id=self._get_session_id(),
                 )
 

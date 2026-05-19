@@ -109,6 +109,13 @@ class ModelConnector:
     def router(self) -> str:
         """Get router type."""
         return self.connection.router
+
+    @property
+    def model_instance_id(self) -> int:
+        """Get the identity of the connected model instance."""
+        if self._model_instance is None:
+            raise RuntimeError("Model is not connected")
+        return id(self._model_instance)
     
     def connect(self) -> bool:
         """
@@ -197,6 +204,23 @@ class ModelConnector:
         """
         if self._model_instance:
             self._model_instance.model_tool_init(tools)
+
+    def add_hook(
+        self,
+        event: str,
+        handler,
+        priority: int = 0,
+        name: str | None = None,
+    ):
+        """Forward hook registration to the underlying LLMClient model."""
+        if not self._model_instance:
+            raise RuntimeError("Model is not connected")
+        return self._model_instance.add_hook(
+            event,
+            handler,
+            priority=priority,
+            name=name,
+        )
     
     def chat(
         self,
@@ -223,7 +247,7 @@ class ModelConnector:
         
         try:
             # Initialize tools if provided
-            if tools:
+            if tools is not None:
                 self.init_tools(tools)
             
             # Call model
@@ -327,7 +351,7 @@ class ModelConnector:
         
         try:
             # Initialize tools if provided
-            if tools:
+            if tools is not None:
                 self.init_tools(tools)
             
             # Use chatToNextLoop from GorAI_LLMClient

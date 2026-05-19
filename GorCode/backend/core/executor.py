@@ -6,7 +6,7 @@ Main backend executor that coordinates model calls, tool execution, and agent ma
 """
 
 from typing import Any, Dict, List, Optional, Generator, AsyncGenerator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import sys
 import os
@@ -20,15 +20,20 @@ from ..tools.core_tool_support.base import ToolRegistry, ToolResult
 from ..agents.base import AgentRegistry, AgentInfo
 from ..session import SessionManager, SessionStorage, DebugLogger
 from ..permission import get_permission_manager, PermissionType, PermissionResponse
-from ..tools.task_tool_support.permission_exec import execute_with_permissions, get_permission_request
+from ..sandbox import SandboxManager, protocol_error_result
+from ..tools.task_tool_support.permission_exec import execute_with_permissions
+from ..hooks import HookRuntime, make_call_base
+from ..hooks.errors import HookExecutionError
 from ..context import (
     TokenEstimator,
-    CompactionManager,
+    TokenUsageTotals,
+    CompressionAlgorithmLoader,
+    CompressionController,
+    CompressionError,
     ResponseCache,
     StreamingOptimizer,
-    create_compaction_manager,
-    build_compaction_status_message,
-    build_compaction_summary_message,
+    normalize_usage_payload,
+    parse_compression_settings,
 )
 from ..skills import SkillLoader, SkillInjector
 from ..context.environment import EnvironmentBlockInputs, build_environment_block
@@ -66,8 +71,10 @@ class GorCodeToolExecutor(ToolExecutor):
     This class bridges GorAI_LLMClient's tool execution interface with GorCode's ToolRegistry.
     """
     
-    def __init__(self, tool_registry: ToolRegistry, event_bus: EventBus = None, 
-                 permission_manager=None, permission_callback=None, backend_state=None):
+    def __init__(self, tool_registry: ToolRegistry, event_bus: EventBus = None,
+                 permission_manager=None, permission_callback=None, backend_state=None,
+                 sandbox_manager=None, hook_runtime: Optional[HookRuntime] = None,
+                 hook_base=None):
         """
         Initialize the executor.
         
@@ -77,12 +84,16 @@ class GorCodeToolExecutor(ToolExecutor):
             permission_manager: Permission manager for session permissions
             permission_callback: Callback for permission UI
             backend_state: Backend state for setting flags
+            sandbox_manager: Sandbox manager for tool boundary checks
         """
         self.tool_registry = tool_registry
         self.event_bus = event_bus
         self._permission_manager = permission_manager
         self._permission_callback = permission_callback
         self._backend_state = backend_state
+        self._sandbox_manager = sandbox_manager
+        self._hook_runtime = hook_runtime
+        self._hook_base = hook_base
         self._user_rejected_without_reason = False  # Flag for rejection without reason
     
     def execute_tool(self, tool_name: str, arguments: Dict[str, Any]) -> str:
@@ -99,11 +110,33 @@ class GorCodeToolExecutor(ToolExecutor):
         if self.tool_registry is None:
             return f"Error: Tool registry not available"
 
-        result = self.tool_registry.execute(tool_name, **arguments)
+        self._sync_task_hook_context()
+        before = self._run_before_tool_hook(tool_name, arguments)
+        arguments = before.arguments
+        early_result = self._resolve_before_tool_result(tool_name, arguments, before)
+        if early_result is not None:
+            return early_result
 
+        pre_result = self._evaluate_pre_execution(tool_name, arguments)
+        if pre_result:
+            return self._format_after_tool_result(
+                tool_name, arguments, pre_result, handled_by_sandbox=True
+            )
+
+        result = self.tool_registry.execute(tool_name, **arguments)
+        return self._complete_host_tool(tool_name, arguments, result)
+
+    def _complete_host_tool(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        result: ToolResult,
+    ) -> str:
         if tool_name == "Skill":
             if result.success:
+                result = self._run_after_tool_hook(tool_name, arguments, result)
                 return result.output
+            result = self._run_after_tool_hook(tool_name, arguments, result)
             return f"Error: {result.error}" if result.error else "Error: Skill loading failed"
 
         tool = self.tool_registry.get(tool_name)
@@ -113,24 +146,119 @@ class GorCodeToolExecutor(ToolExecutor):
             result,
             self._permission_manager,
             self._permission_callback,
+            sandbox_manager=self._sandbox_manager,
+            arguments=arguments,
         )
         if rejected_without_reason:
             self._user_rejected_without_reason = True
             if self._backend_state:
                 self._backend_state.user_rejected_without_reason = True
 
-        if result.success:
-            if result.metadata and "result_object" in result.metadata:
-                return result.metadata.get("result_object")
-            return result.output if result.output else "Command executed successfully"
-        else:
-            # Return error with output if available
-            if result.error:
-                return f"Error: {result.error}"
-            elif result.output:
-                return result.output
-            else:
-                return "Error: Tool execution failed"
+        result = self._run_after_tool_hook(tool_name, arguments, result)
+        return _format_tool_result(result)
+
+    def _resolve_before_tool_result(self, tool_name: str, arguments: Dict[str, Any], before):
+        if before.action == "deny":
+            result = ToolResult(False, "", before.reason or "Tool execution denied by hook")
+            return self._format_after_tool_result(tool_name, arguments, result)
+        if before.action != "handled" or before.tool_result is None:
+            return None
+        return self._format_after_tool_result(
+            tool_name,
+            arguments,
+            before.tool_result,
+            handled_by_hook=True,
+        )
+
+    def _format_after_tool_result(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        result: ToolResult,
+        *,
+        handled_by_hook: bool = False,
+        handled_by_sandbox: bool = False,
+    ) -> str:
+        final = self._run_after_tool_hook(
+            tool_name,
+            arguments,
+            result,
+            handled_by_hook=handled_by_hook,
+            handled_by_sandbox=handled_by_sandbox,
+        )
+        return _format_tool_result(final)
+
+    def _run_before_tool_hook(self, tool_name: str, arguments: Dict[str, Any]):
+        if not self._hook_runtime or not self._hook_base:
+            from ..hooks.runtime import ToolBeforeHookResult
+            return ToolBeforeHookResult(arguments=dict(arguments))
+        try:
+            return self._hook_runtime.before_tool_execute(
+                tool_name,
+                arguments,
+                "",
+                self._hook_base,
+            )
+        except Exception as exc:
+            self._hook_runtime.notify_error(exc, self._hook_base, "tool.before_execute")
+            raise
+
+    def _run_after_tool_hook(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        result: ToolResult,
+        *,
+        handled_by_hook: bool = False,
+        handled_by_sandbox: bool = False,
+    ) -> ToolResult:
+        if not self._hook_runtime or not self._hook_base:
+            return result
+        try:
+            return self._hook_runtime.after_tool_execute(
+                tool_name,
+                arguments,
+                result,
+                self._hook_base,
+                handled_by_hook=handled_by_hook,
+                handled_by_sandbox=handled_by_sandbox,
+            )
+        except Exception as exc:
+            self._hook_runtime.notify_error(exc, self._hook_base, "tool.after_execute")
+            raise
+
+    def _sync_task_hook_context(self) -> None:
+        tool = self.tool_registry.get("Task") if self.tool_registry else None
+        if not tool:
+            return
+        if hasattr(tool, "set_hook_runtime"):
+            tool.set_hook_runtime(self._hook_runtime)
+        if hasattr(tool, "set_hook_run_context") and self._hook_base:
+            tool.set_hook_run_context(
+                self._hook_base.run_id,
+                self._hook_base.session_id,
+                self._hook_base.model_name,
+            )
+
+    def _evaluate_pre_execution(self, tool_name: str, arguments: Dict[str, Any]) -> Optional[ToolResult]:
+        if not self._sandbox_manager:
+            return None
+        try:
+            return self._sandbox_manager.evaluate_pre_execution(tool_name, arguments)
+        except Exception as exc:
+            return protocol_error_result(exc)
+
+
+def _format_tool_result(result: ToolResult) -> str:
+    if result.success:
+        if result.metadata and "result_object" in result.metadata:
+            return result.metadata.get("result_object")
+        return result.output if result.output else "Command executed successfully"
+    if result.error:
+        return f"Error: {result.error}"
+    if result.output:
+        return result.output
+    return "Error: Tool execution failed"
 
 
 @dataclass
@@ -144,6 +272,9 @@ class BackendState:
     user_rejected_without_reason: bool = False  # Flag for rejection without reason
     messages: List[Dict] = None
     token_count: int = 0  # Track current token count
+    session_usage: TokenUsageTotals = field(default_factory=TokenUsageTotals)
+    last_request_usage: Optional[Dict[str, int]] = None
+    current_run_id: Optional[str] = None
     
     def __post_init__(self):
         if self.messages is None:
@@ -174,12 +305,14 @@ class BackendExecutor:
         self._agent_registry: AgentRegistry = None
         self._session_manager: SessionManager = None
         self._debug_logger: DebugLogger = None
-        self._compaction_manager: CompactionManager = None
+        self._compression_controller: Optional[CompressionController] = None
         self._response_cache: ResponseCache = None
         self._streaming_optimizer: StreamingOptimizer = None
         self._skill_loader: SkillLoader = None
         self._skill_injector: SkillInjector = None
         self._platform_detector = platform_detector or PlatformDetector()
+        self._sandbox_manager: Optional[SandboxManager] = None
+        self._hook_runtime: Optional[HookRuntime] = None
         
         # Permission management
         self._permission_manager = get_permission_manager()
@@ -211,6 +344,8 @@ class BackendExecutor:
         # Initialize model manager if config is available
         if config_manager:
             self._permission_manager.apply_settings(config_manager.config)
+            self._init_hook_runtime()
+            self._init_sandbox_manager()
             self._init_model_manager()
             self._init_session_manager()
             self._init_debug_logger()
@@ -233,6 +368,8 @@ class BackendExecutor:
                 task_tool.set_permission_callback(callback)
             if task_tool and hasattr(task_tool, 'set_permission_manager'):
                 task_tool.set_permission_manager(self._permission_manager)
+            if task_tool and hasattr(task_tool, 'set_sandbox_manager'):
+                task_tool.set_sandbox_manager(self._sandbox_manager)
 
     def set_reconnect_callback(self, callback):
         """
@@ -256,6 +393,7 @@ class BackendExecutor:
         self._model_manager.disconnect(model_name)
         if self._model_manager.connect(model_name):
             self.state.current_model = model_name
+            self._attach_compression_to_current_model()
             return True
         
         return False
@@ -425,18 +563,38 @@ class BackendExecutor:
     
     def _init_context_management(self) -> None:
         """Initialize context management (compaction, cache, streaming)."""
-        # Initialize compaction manager
-        self._compaction_manager = create_compaction_manager(
-            event_bus=self.event_bus,
-            config_manager=self._config_manager,
-            model_manager=self._model_manager,
-        )
+        self._init_compression_controller()
         
         # Initialize response cache
         self._response_cache = ResponseCache()
         
         # Initialize streaming optimizer
         self._streaming_optimizer = StreamingOptimizer()
+
+    def _init_compression_controller(self) -> None:
+        """Initialize the unified compression controller."""
+        config = self._config_manager.config
+        settings = parse_compression_settings(config.compression_settings)
+        loader = CompressionAlgorithmLoader(
+            event_bus=self.event_bus,
+            model_manager=self._model_manager,
+            project_path=self._config_manager.project_path,
+        )
+        algorithm = loader.load(settings)
+        self._compression_controller = CompressionController(
+            settings=settings,
+            algorithm=algorithm,
+            max_context_length=config.max_context_length,
+        )
+
+    def _attach_compression_to_current_model(self) -> None:
+        """Attach compression hook to the current connected model."""
+        if not self._compression_controller or not self._model_manager:
+            return
+        current_model = self._model_manager.current()
+        if current_model is None:
+            return
+        self._compression_controller.attach_to_model(current_model)
     
     def _init_model_manager(self) -> None:
         """Initialize model manager from configuration."""
@@ -448,6 +606,26 @@ class BackendExecutor:
         
         # Initialize TaskTool with model connector if available
         self._init_task_tool()
+
+    def _init_sandbox_manager(self) -> None:
+        """Initialize sandbox manager from configuration."""
+        if not self._config_manager:
+            self._sandbox_manager = None
+            return
+        self._sandbox_manager = SandboxManager.from_config(
+            self._config_manager.config,
+            self._config_manager.project_path,
+        )
+
+    def _init_hook_runtime(self) -> None:
+        """Initialize GorCode application hooks from configuration."""
+        if not self._config_manager:
+            self._hook_runtime = None
+            return
+        self._hook_runtime = HookRuntime.from_raw_settings(
+            self._config_manager.config.hook_settings,
+            str(self._config_manager.project_path),
+        )
     
     def _init_session_manager(self) -> None:
         """Initialize session manager."""
@@ -498,6 +676,16 @@ class BackendExecutor:
                     task_tool.set_permission_manager(self._permission_manager)
                 if hasattr(task_tool, 'set_permission_callback'):
                     task_tool.set_permission_callback(self._permission_callback)
+                if hasattr(task_tool, 'set_sandbox_manager'):
+                    task_tool.set_sandbox_manager(self._sandbox_manager)
+                if hasattr(task_tool, 'set_hook_runtime'):
+                    task_tool.set_hook_runtime(self._hook_runtime)
+                if hasattr(task_tool, 'set_hook_run_context'):
+                    task_tool.set_hook_run_context(
+                        self.state.current_run_id,
+                        self._get_session_id(),
+                        self.state.current_model,
+                    )
                 
                 # 设置 config_manager，让 TaskTool 根据 agent_model_mapping 动态选择模型
                 if hasattr(task_tool, 'set_config_manager') and self._config_manager:
@@ -553,6 +741,53 @@ class BackendExecutor:
     def tool_registry(self) -> ToolRegistry:
         """Get tool registry."""
         return self._tool_registry
+
+    @property
+    def sandbox_manager(self) -> Optional[SandboxManager]:
+        """Get sandbox manager."""
+        return self._sandbox_manager
+
+    @property
+    def hook_runtime(self) -> Optional[HookRuntime]:
+        """Get hook runtime."""
+        return self._hook_runtime
+
+    def get_hook_status(self) -> Dict[str, Any]:
+        """Return hook status payload."""
+        if not self._hook_runtime:
+            self._init_hook_runtime()
+        if not self._hook_runtime:
+            return {"enabled": True, "hooks": [], "events": {}}
+        return self._hook_runtime.status()
+
+    def set_sandbox_enabled(self, enabled: bool) -> Dict[str, Any]:
+        """Set session sandbox enablement and return status."""
+        if not self._sandbox_manager:
+            self._init_sandbox_manager()
+        if not self._sandbox_manager:
+            return {"enabled": False, "error": "Sandbox manager not available"}
+        self._sandbox_manager.set_enabled(enabled)
+        return self._sandbox_manager.status()
+
+    def reload_sandbox(self) -> Dict[str, Any]:
+        """Reload sandbox provider from current config."""
+        if not self._config_manager:
+            return {"enabled": False, "error": "Config manager not available"}
+        if not self._sandbox_manager:
+            self._init_sandbox_manager()
+        else:
+            self._config_manager._merged_config = None
+            self._sandbox_manager.reload(self._config_manager.load_config())
+        self._init_task_tool()
+        return self.get_sandbox_status()
+
+    def get_sandbox_status(self) -> Dict[str, Any]:
+        """Return sandbox status."""
+        if not self._sandbox_manager:
+            self._init_sandbox_manager()
+        if not self._sandbox_manager:
+            return {"enabled": False, "error": "Sandbox manager not available"}
+        return self._sandbox_manager.status()
     
     @tool_registry.setter
     def tool_registry(self, value: ToolRegistry) -> None:
@@ -580,9 +815,14 @@ class BackendExecutor:
         return self._debug_logger
     
     @property
-    def compaction_manager(self) -> Optional[CompactionManager]:
-        """Get compaction manager."""
-        return self._compaction_manager
+    def compaction_manager(self):
+        """Legacy compaction manager accessor."""
+        return None
+
+    @property
+    def compression_controller(self) -> Optional[CompressionController]:
+        """Get compression controller."""
+        return self._compression_controller
     
     @property
     def response_cache(self) -> Optional[ResponseCache]:
@@ -597,17 +837,66 @@ class BackendExecutor:
             Token usage dictionary
         """
         self.state.token_count = TokenEstimator.estimate_messages(self.state.messages)
-        
-        if self._compaction_manager:
-            usage = self._compaction_manager.get_token_usage(self.state.messages)
-            usage["current_count"] = self.state.token_count
-            return usage
-        
-        return {
+        context_limit = self._get_context_limit()
+        trigger_tokens = self._get_compression_trigger_tokens()
+        usage = {
             "current_tokens": self.state.token_count,
-            "context_limit": 128000,
-            "usage_percentage": round(self.state.token_count / 128000 * 100, 1),
+            "current_count": self.state.token_count,
+            "context_limit": context_limit,
+            "usage_percentage": self._usage_percentage(self.state.token_count),
+            "should_compact": self.state.token_count >= trigger_tokens,
+            "should_soft_compact": self.state.token_count >= trigger_tokens,
+            "should_hard_compact": self.state.token_count >= trigger_tokens,
+            "soft_threshold": trigger_tokens,
+            "hard_threshold": trigger_tokens,
+            "compression": self._compression_status(),
         }
+        self._add_session_usage_to_payload(usage)
+        return usage
+
+    def _get_context_limit(self) -> int:
+        if self._config_manager:
+            return int(self._config_manager.config.max_context_length)
+        return 128000
+
+    def _get_compression_trigger_tokens(self) -> int:
+        if self._compression_controller:
+            return self._compression_controller.trigger_tokens
+        return int(self._get_context_limit() * 0.85)
+
+    def _usage_percentage(self, token_count: int) -> float:
+        context_limit = self._get_context_limit()
+        if context_limit <= 0:
+            return 0
+        return round(token_count / context_limit * 100, 1)
+
+    def _compression_status(self) -> Dict[str, Any]:
+        if self._compression_controller:
+            return self._compression_controller.status()
+        return {"enabled": False}
+
+    def _add_session_usage_to_payload(self, payload: Dict[str, Any]) -> None:
+        payload.update(self.state.session_usage.to_session_payload())
+        payload["last_request_usage"] = self.state.last_request_usage
+
+    def reset_token_usage(self) -> None:
+        """Reset real provider token usage for the active session."""
+        self.state.session_usage = TokenUsageTotals()
+        self.state.last_request_usage = None
+        if self._session_manager:
+            self._session_manager.clear_token_usage()
+
+    def restore_token_usage(self, usage: Dict[str, Any]) -> None:
+        """Restore real provider token usage from session metadata."""
+        self.state.session_usage = TokenUsageTotals.from_dict(usage)
+        self.state.last_request_usage = None
+
+    def _record_usage_event(self, event: Dict[str, Any]) -> None:
+        usage = normalize_usage_payload(event.get("usage"))
+        self.state.session_usage = self.state.session_usage.add_usage(usage)
+        self.state.last_request_usage = usage
+        if self._session_manager:
+            self._session_manager.set_token_usage(self.state.session_usage.to_dict())
     
     def check_context_overflow(self) -> bool:
         """
@@ -616,9 +905,9 @@ class BackendExecutor:
         Returns:
             True if overflow detected
         """
-        if self._compaction_manager:
-            return self._compaction_manager.check_soft_compact_needed(self.state.messages)
-        return False
+        return TokenEstimator.estimate_messages(self.state.messages) >= (
+            self._get_compression_trigger_tokens()
+        )
     
     def check_context_hard_overflow(self) -> bool:
         """
@@ -627,58 +916,7 @@ class BackendExecutor:
         Returns:
             True if hard overflow detected
         """
-        if self._compaction_manager:
-            return self._compaction_manager.check_hard_compact_needed(self.state.messages)
-        return False
-    
-    def _auto_compact_context(self) -> Generator[Event, None, None]:
-        """
-        Automatically compact context when token threshold is reached.
-        
-        This is called internally during the chat loop when context grows too large.
-        
-        Yields:
-            Event objects for frontend to process
-        """
-        if not self._compaction_manager:
-            return
-        
-        # Get token usage before compaction
-        usage_before = self._compaction_manager.get_token_usage(self.state.messages)
-        
-        # Perform compaction
-        result = self._compaction_manager.compact(self.state.messages)
-        
-        if result.success and result.compaction_type != "none":
-            # Update messages with compacted version
-            self.state.messages = result.messages
-            self.state.token_count = result.compacted_tokens
-            
-            # Sync with session manager
-            if self._session_manager:
-                self._session_manager.set_messages(self.state.messages)
-            
-            status_msg = build_compaction_status_message(
-                result,
-                include_emoji=True,
-            )
-            
-            # Emit compaction event
-            yield Event(EventType.UI_MESSAGE, {"message": status_msg})
-            
-            # Emit compaction summary if available (full text, no truncation)
-            summary_msg = build_compaction_summary_message(result)
-            if summary_msg:
-                yield Event(EventType.UI_MESSAGE, {"message": summary_msg})
-            
-            # Emit compaction details event
-            self.emit(EventType.SESSION_SAVE, {
-                "action": "auto_compaction",
-                "compaction_type": result.compaction_type,
-                "original_tokens": result.original_tokens,
-                "compacted_tokens": result.compacted_tokens,
-                "compression_ratio": result.compression_ratio,
-            })
+        return self.check_context_overflow()
     
     def compact_context(self, force: bool = False, force_soft: bool = False) -> Dict[str, Any]:
         """
@@ -691,40 +929,70 @@ class BackendExecutor:
         Returns:
             Compaction result
         """
-        if not self._compaction_manager:
-            return {"success": False, "error": "Compaction not initialized"}
-        
-        result = self._compaction_manager.compact(self.state.messages, force=force, force_soft=force_soft)
-        
-        if result.success:
-            # Update messages with compacted version
-            self.state.messages = result.messages
-            self.state.token_count = result.compacted_tokens
-            
-            # Sync with session manager
-            if self._session_manager:
-                self._session_manager.set_messages(self.state.messages)
-            
-            status_msg = build_compaction_status_message(result)
-            
-            self.emit(EventType.UI_MESSAGE, {"message": status_msg})
-            
-            # Emit compaction summary if available (full text, no truncation)
-            summary_msg = build_compaction_summary_message(result)
-            if summary_msg:
-                self.emit(EventType.UI_MESSAGE, {"message": summary_msg})
-        
+        if not self._compression_controller:
+            return {"success": False, "error": "Compression not initialized"}
+        if not self._compression_controller.settings.enabled:
+            return {"success": False, "error": "Compression is disabled"}
+        try:
+            result = self._run_manual_compression(force, force_soft)
+        except CompressionError as exc:
+            return {"success": False, "error": str(exc)}
+        self._apply_manual_compression_result(result)
+        return self._manual_compression_payload(result)
+
+    def _run_manual_compression(self, force: bool, force_soft: bool):
+        messages = [
+            {"role": "system", "content": self.get_system_prompt()},
+            *self.state.messages,
+        ]
+        return self._compression_controller.compress_now(
+            messages,
+            force=True,
+            source="manual",
+            metadata={"force": force, "force_soft": force_soft},
+        )
+
+    def _apply_manual_compression_result(self, result) -> None:
+        compressed = self._strip_leading_system(result.messages)
+        self.state.messages = compressed
+        self.state.token_count = result.compacted_tokens
+        if self._session_manager:
+            self._session_manager.set_messages(self.state.messages)
+        self.emit(EventType.UI_MESSAGE, {
+            "message": (
+                "Context compacted: "
+                f"{result.original_tokens} -> {result.compacted_tokens} tokens "
+                f"({result.compression_ratio:.1f}x)"
+            )
+        })
+        self._emit_manual_compression_summary(result)
+
+    def _strip_leading_system(self, messages: List[Dict]) -> List[Dict]:
+        if messages and messages[0].get("role") == "system":
+            return [dict(message) for message in messages[1:]]
+        return [dict(message) for message in messages]
+
+    def _emit_manual_compression_summary(self, result) -> None:
+        summary = result.metadata.get("summary")
+        if summary:
+            self.emit(EventType.UI_MESSAGE, {"message": f"[Compaction Summary] {summary}"})
+
+    def _manual_compression_payload(self, result) -> Dict[str, Any]:
+        metadata = dict(result.metadata)
         return {
-            "success": result.success,
+            "success": True,
+            "algorithm": result.algorithm,
             "original_tokens": result.original_tokens,
             "compacted_tokens": result.compacted_tokens,
+            "trigger_tokens": result.trigger_tokens,
             "compression_ratio": result.compression_ratio,
-            "pruned_tool_results": result.pruned_tool_results,
-            "cleared_tool_results": result.cleared_tool_results,
-            "compaction_type": result.compaction_type,
-            "protected_tool_calls": result.protected_tool_calls,
-            "summary": result.summary,
-            "error": result.error,
+            "metadata": metadata,
+            "pruned_tool_results": metadata.get("pruned_tool_results", 0),
+            "cleared_tool_results": metadata.get("cleared_tool_results", 0),
+            "compaction_type": metadata.get("compaction_type", "none"),
+            "protected_tool_calls": metadata.get("protected_tool_calls", []),
+            "summary": metadata.get("summary"),
+            "error": None,
         }
     
     def emit(self, event_type: EventType, data: Any = None) -> None:
@@ -743,6 +1011,7 @@ class BackendExecutor:
         """
         if self._agent_registry and agent_name in self._agent_registry.agents:
             self.state.current_agent = agent_name
+            self._sync_current_session_agent(agent_name)
             self.emit(EventType.AGENT_SWITCH, {"agent": agent_name})
             
             # 更新 TaskTool 的父代理名
@@ -785,11 +1054,20 @@ class BackendExecutor:
         # Connect to new model
         if self._model_manager.connect(model_name):
             self.state.current_model = model_name
-            self.emit(EventType.UI_MESSAGE, {"message": f"Switched to model: {model_name}"})
+            self._sync_current_session_model(model_name)
+            self._attach_compression_to_current_model()
             return True
         
         self.emit(EventType.UI_MESSAGE, {"message": f"Failed to connect to model: {model_name}"})
         return False
+
+    def _sync_current_session_agent(self, agent_name: str) -> None:
+        if self._session_manager:
+            self._session_manager.update_agent(agent_name)
+
+    def _sync_current_session_model(self, model_name: str) -> None:
+        if self._session_manager:
+            self._session_manager.update_model(model_name)
     
     def check_interrupt(self) -> bool:
         """Check if execution should be interrupted."""
@@ -870,6 +1148,39 @@ class BackendExecutor:
         if self._config_manager:
             return str(self._config_manager.project_path)
         return str(os.getcwd())
+
+    def _get_session_id(self) -> Optional[str]:
+        if self._session_manager and self._session_manager.current_session:
+            return self._session_manager.current_session.session_id
+        return None
+
+    def _main_hook_base(self, run_id: str):
+        if not self._hook_runtime:
+            self._init_hook_runtime()
+        return make_call_base(
+            runtime=self._hook_runtime,
+            run_id=run_id,
+            session_id=self._get_session_id(),
+            source="main",
+            agent_name=self.state.current_agent,
+            model_name=self.state.current_model,
+        )
+
+    def _sync_task_hook_context(self, run_id: Optional[str]) -> None:
+        if not self._tool_registry:
+            return
+        task_tool = self._tool_registry.get("Task")
+        if not task_tool:
+            return
+        if hasattr(task_tool, "set_hook_runtime"):
+            task_tool.set_hook_runtime(self._hook_runtime)
+        if hasattr(task_tool, "set_hook_run_context"):
+            task_tool.set_hook_run_context(run_id, self._get_session_id(), self.state.current_model)
+
+    def _notify_run_error(self, error: Exception, stage: str) -> None:
+        if not self._hook_runtime or not self.state.current_run_id:
+            return
+        self._hook_runtime.notify_error(error, self._main_hook_base(self.state.current_run_id), stage)
     
     def process_user_input(self, user_input: str) -> Generator[Event, None, None]:
         """
@@ -883,6 +1194,26 @@ class BackendExecutor:
         Yields:
             Event objects for frontend to process
         """
+        run_id = self._hook_runtime.new_run_id() if self._hook_runtime else f"run-{int(time.time() * 1000)}"
+        self.state.current_run_id = run_id
+        self._sync_task_hook_context(run_id)
+
+        if self._hook_runtime:
+            try:
+                hook_result = self._hook_runtime.before_input_accept(
+                    user_input,
+                    self._main_hook_base(run_id),
+                    "user_message",
+                )
+            except Exception as exc:
+                self._notify_run_error(exc, "input.before_accept")
+                yield Event(EventType.MODEL_ERROR, {"error": str(exc)})
+                return
+            if hook_result.action == "deny":
+                yield Event(EventType.MODEL_ERROR, {"error": hook_result.reason or "Input denied"})
+                return
+            user_input = hook_result.payload.get("input", user_input)
+
         # Add user message to history
         self.state.messages.append({
             "role": "user",
@@ -945,6 +1276,7 @@ class BackendExecutor:
             if model is None:
                 yield Event(EventType.MODEL_ERROR, {"error": "No model connected"})
                 return
+            self._attach_compression_to_current_model()
             
             # Get tools for current agent
             tools = []
@@ -966,7 +1298,10 @@ class BackendExecutor:
                 self.event_bus,
                 permission_manager=self._permission_manager,
                 permission_callback=self._permission_callback,
-                backend_state=self.state
+                backend_state=self.state,
+                sandbox_manager=self._sandbox_manager,
+                hook_runtime=self._hook_runtime,
+                hook_base=self._main_hook_base(self.state.current_run_id or "") if self._hook_runtime else None,
             )
             
             # Define interrupt check
@@ -976,6 +1311,18 @@ class BackendExecutor:
             # Prepare messages with system prompt
             system_prompt = self.get_system_prompt()
             messages_with_system = [{"role": "system", "content": system_prompt}] + self.state.messages
+            if self._hook_runtime:
+                messages_with_system, tools, _ = self._hook_runtime.before_model_request(
+                    messages_with_system,
+                    tools,
+                    self._main_hook_base(self.state.current_run_id or ""),
+                )
+            response_payload = {
+                "answer_content": "",
+                "reasoning_content": "",
+                "tool_calls": [],
+                "usage": None,
+            }
             
             # Use chatToNextLoop for the full agentic loop with reconnect handling
             while True:
@@ -1004,32 +1351,33 @@ class BackendExecutor:
                     self._emit_reconnect_success_if_pending(event)
                     self._reset_reconnect_failures_on_normal_event(event)
                     
-                    # Check if context compaction is needed after each tool result
                     if event_type == "tool_result":
-                        # Update state.messages from messages_with_system (excluding system prompt)
                         self._sync_messages_from_system(messages_with_system, sync_session=False)
-                        
-                        # Check and trigger auto-compaction if needed
-                        if self._compaction_manager and self._compaction_manager.should_compact(self.state.messages):
-                            yield from self._auto_compact_context()
                     
                     # Handle different event types
                     if event_type == "thinking":
                         # Thinking content
                         content = event.get("content", "")
+                        response_payload["reasoning_content"] += content
                         yield Event(EventType.MODEL_THINKING, {"content": content})
                     
                     elif event_type == "answer":
                         # Answer content
                         content = event.get("content", "")
+                        response_payload["answer_content"] += content
                         yield Event(EventType.MODEL_ANSWER, {
                             "content": content,
                             "agent_name": self.state.current_agent,
                         })
+
+                    elif event_type == "usage":
+                        response_payload["usage"] = event.get("usage")
+                        self._record_usage_event(event)
                     
                     elif event_type == "tool_calls":
                         # Tool calls notification (before execution)
                         tool_calls = event.get("tool_calls", [])
+                        response_payload["tool_calls"].extend(tool_calls)
                         for tc in tool_calls:
                             func = tc.get("function", {})
                             tool_name = func.get("name", "unknown")
@@ -1124,6 +1472,11 @@ class BackendExecutor:
             
             # Sync messages from chat_to_next_loop back to state.messages
             # messages_with_system[0] is system prompt, rest are conversation
+            if self._hook_runtime:
+                self._hook_runtime.after_model_response(
+                    response_payload,
+                    self._main_hook_base(self.state.current_run_id or ""),
+                )
             self._sync_messages_from_system(messages_with_system)
             
         except UserRejectionError as e:
@@ -1148,6 +1501,7 @@ class BackendExecutor:
             })
             
         except Exception as e:
+            self._notify_run_error(e, "chat_loop")
             # Log error
             self._log_debug_model_call(
                 model=self.state.current_model,
@@ -1192,31 +1546,26 @@ class BackendExecutor:
                     arguments=arguments,
                 )
                 
-                # Check if tool requires permission BEFORE execution
                 tool = self._tool_registry.get(tool_name)
-                result = self._tool_registry.execute(tool_name, **arguments)
-                permission_type = get_permission_request(
-                    tool_name,
-                    tool,
-                    result,
-                    self._permission_manager,
-                )
-                if permission_type:
-                    yield Event(EventType.PERMISSION_REQUEST, {
-                        "tool_name": tool_name,
-                        "permission_type": permission_type.value,
-                        "metadata": result.metadata,
-                    })
-                
-                result, rejected_without_reason = execute_with_permissions(
-                    tool_name,
-                    tool,
-                    result,
-                    self._permission_manager,
-                    self._permission_callback,
-                )
-                if rejected_without_reason:
-                    self.state.user_rejected_without_reason = True
+                result = None
+                if self._sandbox_manager:
+                    try:
+                        result = self._sandbox_manager.evaluate_pre_execution(tool_name, arguments)
+                    except Exception as exc:
+                        result = protocol_error_result(exc)
+                if result is None:
+                    result = self._tool_registry.execute(tool_name, **arguments)
+                    result, rejected_without_reason = execute_with_permissions(
+                        tool_name,
+                        tool,
+                        result,
+                        self._permission_manager,
+                        self._permission_callback,
+                        sandbox_manager=self._sandbox_manager,
+                        arguments=arguments,
+                    )
+                    if rejected_without_reason:
+                        self.state.user_rejected_without_reason = True
                 
                 # Get output for agent - include error message if present
                 tool_output = result.output
@@ -1275,6 +1624,7 @@ class BackendExecutor:
     def reset_messages(self) -> None:
         """Reset message history."""
         self.state.messages = []
+        self.reset_token_usage()
         
         # Clear session messages
         if self._session_manager:
@@ -1289,6 +1639,7 @@ class BackendExecutor:
     def load_messages(self, messages: List[Dict]) -> None:
         """Load message history."""
         self.state.messages = messages.copy()
+        self.reset_token_usage()
         
         # Set messages in session manager
         if self._session_manager:
@@ -1345,6 +1696,9 @@ class BackendExecutor:
         """
         from pathlib import Path
         from ..context import get_default_prompt_file_path, get_custom_prompt_file_path
+        if self._hook_runtime and not self.state.current_run_id:
+            self.state.current_run_id = self._hook_runtime.new_run_id()
+            self._sync_task_hook_context(self.state.current_run_id)
         
         project_path = self._get_workdir()
         
@@ -1387,6 +1741,7 @@ class BackendExecutor:
             if model is None:
                 yield Event(EventType.MODEL_ERROR, {"error": "No model connected"})
                 return
+            self._attach_compression_to_current_model()
             
             # Get tools for file operations
             tools = []
@@ -1399,12 +1754,27 @@ class BackendExecutor:
                 self.event_bus,
                 permission_manager=self._permission_manager,
                 permission_callback=self._permission_callback,
-                backend_state=self.state
+                backend_state=self.state,
+                sandbox_manager=self._sandbox_manager,
+                hook_runtime=self._hook_runtime,
+                hook_base=self._main_hook_base(self.state.current_run_id or "") if self._hook_runtime else None,
             )
             
             # Prepare system prompt
             system_prompt = self.get_system_prompt()
             messages_with_system = [{"role": "system", "content": system_prompt}] + self.state.messages
+            if self._hook_runtime:
+                messages_with_system, tools, _ = self._hook_runtime.before_model_request(
+                    messages_with_system,
+                    tools,
+                    self._main_hook_base(self.state.current_run_id or ""),
+                )
+            response_payload = {
+                "answer_content": "",
+                "reasoning_content": "",
+                "tool_calls": [],
+                "usage": None,
+            }
             
             # Run chat loop with reconnect handling
             generated_content = ""
@@ -1435,12 +1805,16 @@ class BackendExecutor:
                     if event_type == "answer":
                         content = event.get("content", "")
                         generated_content += content
+                        response_payload["answer_content"] += content
                         yield Event(EventType.MODEL_ANSWER, {
                             "content": content,
                             "agent_name": self.state.current_agent,
                         })
+                    elif event_type == "thinking":
+                        response_payload["reasoning_content"] += event.get("content", "")
                     elif event_type == "tool_calls":
                         tool_calls = event.get("tool_calls", [])
+                        response_payload["tool_calls"].extend(tool_calls)
                         for tc in tool_calls:
                             func = tc.get("function", {})
                             tool_name = func.get("name", "unknown")
@@ -1474,6 +1848,8 @@ class BackendExecutor:
                     elif event_type == "interrupted":
                         yield Event(EventType.SYSTEM_INTERRUPT, {"message": "Execution interrupted"})
                         return
+                    elif event_type == "usage":
+                        response_payload["usage"] = event.get("usage")
                 
                 if not reconnect_needed:
                     break
@@ -1488,8 +1864,14 @@ class BackendExecutor:
                 yield Event(EventType.UI_MESSAGE, {
                     "message": "注意: 模型可能未创建GORCODE.md文件，请检查响应"
                 })
+            if self._hook_runtime:
+                self._hook_runtime.after_model_response(
+                    response_payload,
+                    self._main_hook_base(self.state.current_run_id or ""),
+                )
             
         except Exception as e:
+            self._notify_run_error(e, "init.generate")
             yield Event(EventType.MODEL_ERROR, {"error": f"Init command failed: {e}"})
         finally:
             # Restore original messages

@@ -40,6 +40,7 @@ class FileStateCache:
 
     def __init__(self, max_preview_chars: int = DEFAULT_MAX_CACHE_CONTENT_CHARS) -> None:
         self._states: Dict[str, FileState] = {}
+        self._partial_windows: Dict[str, list[FileState]] = {}
         self._max_preview_chars = max_preview_chars
 
     def get_state(self, path: Path) -> Optional[FileState]:
@@ -66,7 +67,7 @@ class FileStateCache:
             line_ending=line_ending,
             updated_by="read",
         )
-        self._states[state.path] = state
+        self._remember_read_state(path, state)
         return state
 
     def snapshot_write(
@@ -89,6 +90,7 @@ class FileStateCache:
             updated_by=updated_by,
         )
         self._states[state.path] = state
+        self._partial_windows.pop(state.path, None)
         return state
 
     def snapshot_bytes(
@@ -104,13 +106,31 @@ class FileStateCache:
             updated_by=updated_by,
         )
         self._states[state.path] = state
+        self._partial_windows.pop(state.path, None)
         return state
 
     def has_full_read(self, path: Path) -> bool:
+        return self.has_full_snapshot(path)
+
+    def has_full_snapshot(self, path: Path) -> bool:
         state = self.get_state(path)
         if not state:
             return False
-        return state.updated_by == "read" and not state.is_partial
+        return not state.is_partial
+
+    def has_partial_windows(self, path: Path) -> bool:
+        return bool(self.get_partial_windows(path))
+
+    def get_partial_windows(self, path: Path) -> list[FileState]:
+        return list(self._partial_windows.get(str(path), []))
+
+    def find_partial_window_containing(self, path: Path, text: str) -> Optional[FileState]:
+        if not text:
+            return None
+        for window in self.get_partial_windows(path):
+            if window.content_preview and text in window.content_preview:
+                return window
+        return None
 
     def is_modified_since(self, path: Path, state: FileState) -> bool:
         stat = path.stat()
@@ -126,13 +146,11 @@ class FileStateCache:
         limit: Optional[int],
     ) -> bool:
         state = self.get_state(path)
-        if not state or state.updated_by != "read":
-            return False
-        if state.is_partial and (state.offset != offset or state.limit != limit):
+        if not state or state.is_partial:
             return False
         if not state.is_partial and (offset != 0 or limit is not None):
             return False
-        return not self.is_modified_since(path, state)
+        return state.content_is_full and not self.is_modified_since(path, state)
 
     def get_cached_preview(self, path: Path) -> Optional[str]:
         state = self.get_state(path)
@@ -197,6 +215,21 @@ class FileStateCache:
             content_preview=None,
             content_is_full=False,
         )
+
+    def _remember_read_state(self, path: Path, state: FileState) -> None:
+        if not state.is_partial:
+            self._states[state.path] = state
+            self._partial_windows.pop(state.path, None)
+            return
+
+        existing = self._states.get(state.path)
+        if existing and self.is_modified_since(path, existing):
+            self._partial_windows.pop(state.path, None)
+            existing = None
+
+        self._partial_windows.setdefault(state.path, []).append(state)
+        if not existing or existing.is_partial:
+            self._states[state.path] = state
 
 
 def _hash_text(text: str, encoding: str) -> str:

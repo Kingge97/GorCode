@@ -6,21 +6,17 @@ Tool for spawning and managing subagents.
 """
 
 import time
-import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from dataclasses import dataclass
 
 from .core_tool_support.base import BaseTool, ToolResult
 from .core_tool_support.tool_utils import build_parameters_schema, tool_error_result
-from ..core.events import EventBus, Event, EventType
-from ..context import (
-    CompactionManager,
-    create_compaction_manager,
-    build_compaction_status_message,
-    build_compaction_summary_message,
-)
+from ..core.events import EventBus, EventType
 from ..permission import get_permission_manager
-from .task_tool_support.permission_exec import execute_with_permissions
+from .task_tool_support.subagent_executor import SubagentToolExecutor
+
+if TYPE_CHECKING:
+    from ..hooks.runtime import HookRuntime
 
 
 @dataclass
@@ -83,6 +79,7 @@ class TaskTool(BaseTool):
         config_manager=None,
         permission_manager=None,
         permission_callback=None,
+        sandbox_manager=None,
     ):
         """
         Initialize Task tool.
@@ -106,44 +103,21 @@ class TaskTool(BaseTool):
         self._model_connectors: Dict[str, Any] = {}  # Cache for model connectors by agent type
         self._permission_manager = permission_manager or get_permission_manager()
         self._permission_callback = permission_callback
+        self._sandbox_manager = sandbox_manager
+        self._hook_runtime: Optional["HookRuntime"] = None
+        self._hook_run_id: Optional[str] = None
+        self._hook_session_id: Optional[str] = None
+        self._hook_model_name: Optional[str] = None
         self._subagent_seq = 0  # Incremental id for subagent runs
         
-        # Initialize compaction manager for subagent context management
-        # Use config_manager settings if available, otherwise use defaults
-        self._compaction_manager = self._init_compaction_manager()
-    
-    def _init_compaction_manager(self, model_connector=None) -> CompactionManager:
-        """
-        Initialize compaction manager with config from config_manager.
-        
-        Uses the same configuration as the main agent to ensure consistency.
-        
-        Args:
-            model_connector: Optional model connector for summary generation
-            
-        Returns:
-            CompactionManager instance
-        """
-        # Use provided connector or fall back to default
-        connector = model_connector or self._model_connector
-        return create_compaction_manager(
-            event_bus=self._event_bus,
-            config_manager=self._config_manager,
-            model_connector=connector,
-        )
     
     def set_model_connector(self, connector) -> None:
         """Set the model connector for subagent calls."""
         self._model_connector = connector
-        # Update compaction manager's model connector
-        if self._compaction_manager:
-            self._compaction_manager._model_connector = connector
     
     def set_config_manager(self, config_manager) -> None:
         """Set the config manager for dynamic model selection."""
         self._config_manager = config_manager
-        # Re-initialize compaction manager with new config
-        self._compaction_manager = self._init_compaction_manager()
     
     def _get_model_connector_for_agent(self, agent_type: str) -> Any:
         """
@@ -198,11 +172,68 @@ class TaskTool(BaseTool):
     def set_permission_callback(self, callback) -> None:
         """Set the permission callback for subagent tool execution."""
         self._permission_callback = callback
+
+    def set_sandbox_manager(self, manager) -> None:
+        """Set the sandbox manager for subagent tool execution."""
+        self._sandbox_manager = manager
+
+    def set_hook_runtime(self, runtime: Optional["HookRuntime"]) -> None:
+        """Set the hook runtime for subagent execution."""
+        self._hook_runtime = runtime
+
+    def set_hook_run_context(
+        self,
+        run_id: Optional[str],
+        session_id: Optional[str],
+        model_name: Optional[str],
+    ) -> None:
+        """Set parent run context used by subagent hooks."""
+        self._hook_run_id = run_id
+        self._hook_session_id = session_id
+        self._hook_model_name = model_name
     
     def _next_subagent_run_id(self) -> str:
         """Generate a unique id for a subagent run."""
         self._subagent_seq += 1
         return f"subagent-{self._subagent_seq}"
+
+    def _subagent_hook_base(
+        self,
+        agent_type: str,
+        parent_name: Optional[str],
+        subagent_run_id: str,
+    ):
+        if not self._hook_runtime:
+            return None
+        from ..hooks.runtime import make_call_base
+
+        run_id = self._hook_run_id or self._hook_runtime.new_run_id()
+        return make_call_base(
+            runtime=self._hook_runtime,
+            run_id=run_id,
+            session_id=self._hook_session_id,
+            source="subagent",
+            agent_name=agent_type,
+            agent_run_id=subagent_run_id,
+            parent_agent=parent_name,
+            subagent_type=agent_type,
+            model_name=self._hook_model_name,
+        )
+
+    def _apply_subagent_input_hook(
+        self,
+        prompt: str,
+        agent_type: str,
+        parent_name: Optional[str],
+        subagent_run_id: str,
+    ) -> Optional[str]:
+        base = self._subagent_hook_base(agent_type, parent_name, subagent_run_id)
+        if not self._hook_runtime or not base:
+            return prompt
+        result = self._hook_runtime.before_input_accept(prompt, base, "subagent_task")
+        if result.action == "deny":
+            return None
+        return result.payload.get("input", prompt)
 
     def _build_display_name(self, parent_name: Optional[str], agent_type: str) -> str:
         """Build display name with nesting path."""
@@ -280,6 +311,9 @@ class TaskTool(BaseTool):
         parent_name = self._parent_agent_name
         display_name = self._build_display_name(parent_name, agent_type)
         subagent_run_id = self._next_subagent_run_id()
+        prompt = self._apply_subagent_input_hook(prompt, agent_type, parent_name, subagent_run_id)
+        if prompt is None:
+            return ToolResult(False, "", "Subagent task denied by hook")
 
         # Emit subagent start event (for UI display)
         self._emit_event(EventType.AGENT_SUBAGENT_START, {
@@ -304,138 +338,46 @@ class TaskTool(BaseTool):
             {"role": "user", "content": prompt}
         ]
         
-        # Re-initialize compaction manager with the actual model connector being used
-        if model_connector:
-            self._compaction_manager = self._init_compaction_manager(model_connector)
-        
-        # Normalize max_steps: None/<=0 means unlimited
-        normalized_max_steps = None
-        try:
-            if max_steps is not None and int(max_steps) > 0:
-                normalized_max_steps = int(max_steps)
-        except (TypeError, ValueError):
-            normalized_max_steps = None
+        normalized_max_steps = self._normalize_max_steps(max_steps)
         
         # Execute subagent loop
         start_time = time.time()
-        tool_count = 0
-        final_output = ""
-        last_content = ""  # 追踪上次发送的内容，避免重复
-        step = 0
-        
         previous_parent_name = self._parent_agent_name
         self._parent_agent_name = display_name
 
         try:
-            while True:
-                if normalized_max_steps is not None and step >= normalized_max_steps:
-                    break
-                # Call model with the appropriate connector for this agent type
-                response = self._call_model(
-                    messages,
-                    display_name,
-                    model_connector,
-                    agent_run_id=subagent_run_id,
+            tool_executor = self._create_subagent_executor(
+                agent_type,
+                normalized_max_steps,
+                subagent_run_id,
+                parent_name,
+            )
+            loop_result = self._run_model_loop(
+                messages,
+                display_name,
+                agent_type,
+                model_connector,
+                subagent_run_id,
+                tool_executor,
+            )
+
+            if loop_result["error"]:
+                self._emit_subagent_end(
+                    agent_type=agent_type,
+                    success=False,
+                    output=loop_result["error"],
+                    parent_name=parent_name,
+                    subagent_run_id=subagent_run_id,
+                    display_name=display_name,
                 )
-                
-                if response.is_error:
-                    # 发出子代理结束事件
-                    self._emit_subagent_end(
-                        agent_type=agent_type,
-                        success=False,
-                        output=response.error_message,
-                        parent_name=parent_name,
-                        subagent_run_id=subagent_run_id,
-                        display_name=display_name,
-                    )
-                    return ToolResult(
-                        success=False,
-                        output="",
-                        error=f"Subagent model error: {response.error_message}"
-                    )
-                
-                # Count this iteration as a step
-                step += 1
-                
-                # Check if we have a final response (no tool calls)
-                if not response.tool_calls:
-                    final_output = response.content
-                    break
-                
-                # Process tool calls
-                tool_results = []
-                for tool_call in response.tool_calls:
-                    tool_name = tool_call.get("function", {}).get("name", "")
-                    tool_args = json.loads(tool_call.get("function", {}).get("arguments", "{}"))
-                    
-                    # Check if tool is allowed for this agent
-                    if not self._is_tool_allowed(agent_type, tool_name):
-                        tool_results.append({
-                            "tool_call_id": tool_call.get("id", ""),
-                            "result": f"Tool '{tool_name}' is not allowed for agent type '{agent_type}'"
-                        })
-                        continue
-                    
-                    # 发出工具执行开始事件（带有代理名）
-                    self._emit_event(EventType.TOOL_EXECUTION_START, {
-                        "tool_name": tool_name,
-                        "tool_call_id": tool_call.get("id", ""),
-                        "args": tool_args,
-                        "agent_name": display_name,
-                        "agent_run_id": subagent_run_id,
-                    })
-                    
-                    # Execute tool
-                    if self._tool_registry:
-                        result = self._execute_tool_with_permissions(tool_name, tool_args)
-                        tool_results.append({
-                            "tool_call_id": tool_call.get("id", ""),
-                            "result": result.output if result.success else f"Error: {result.error}"
-                        })
-                        tool_count += 1
-                        
-                        # 发出工具结果事件（带有代理名）
-                        self._emit_event(EventType.TOOL_RESULT, {
-                            "tool_name": tool_name,
-                            "tool_call_id": tool_call.get("id", ""),
-                            "result": result.output if result.success else f"Error: {result.error}",
-                            "success": result.success,
-                            "agent_name": display_name,
-                            "agent_run_id": subagent_run_id,
-                        })
-                
-                # Add assistant message and tool results
-                messages.append({"role": "assistant", "content": response.content or "", "tool_calls": response.tool_calls})
-                for tr in tool_results:
-                    messages.append({"role": "tool", "tool_call_id": tr["tool_call_id"], "content": tr["result"]})
-                
-                # Check if context compaction is needed after each tool execution
-                if self._compaction_manager and self._compaction_manager.should_compact(messages):
-                    # Perform auto-compaction
-                    result = self._compaction_manager.compact(messages)
-                    
-                    if result.success and result.compaction_type != "none":
-                        messages = result.messages
-                        
-                        status_msg = build_compaction_status_message(
-                            result,
-                            prefix="Subagent",
-                            include_emoji=True,
-                            lowercase_type=True,
-                        )
-                        
-                        # Emit compaction event for UI notification
-                        self._emit_event(EventType.UI_MESSAGE, {"message": status_msg})
-                        
-                        # Emit compaction summary if available (full text, no truncation)
-                        summary_msg = build_compaction_summary_message(
-                            result,
-                            prefix="Subagent",
-                        )
-                        if summary_msg:
-                            self._emit_event(EventType.UI_MESSAGE, {"message": summary_msg})
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=f"Subagent model error: {loop_result['error']}"
+                )
             
             duration = time.time() - start_time
+            final_output = loop_result["output"]
             
             # 发出子代理结束事件
             self._emit_subagent_end(
@@ -455,9 +397,9 @@ class TaskTool(BaseTool):
                 metadata={
                     "agent_type": agent_type,
                     "description": description,
-                    "tool_calls": tool_count,
+                    "tool_calls": tool_executor.tool_calls,
                     "duration": duration,
-                    "steps": step,
+                    "steps": loop_result["steps"],
                 }
             )
             
@@ -475,36 +417,192 @@ class TaskTool(BaseTool):
         finally:
             self._parent_agent_name = previous_parent_name
 
-    def _execute_tool_with_permissions(
+    def _normalize_max_steps(self, max_steps: Optional[int]) -> Optional[int]:
+        try:
+            value = int(max_steps) if max_steps is not None else 0
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    def _create_subagent_executor(
         self,
-        tool_name: str,
-        tool_args: Dict[str, Any],
-    ) -> ToolResult:
-        """Execute a tool with permission checks (write/edit/bash)."""
-        if not self._tool_registry:
-            return ToolResult(
-                success=False,
-                output="",
-                error="Tool registry not available"
-            )
-        
-        tool = self._tool_registry.get(tool_name)
-        if tool is None:
-            return ToolResult(
-                success=False,
-                output="",
-                error=f"Tool '{tool_name}' not found"
-            )
-        
-        result = self._tool_registry.execute(tool_name, **tool_args)
-        result, _ = execute_with_permissions(
-            tool_name,
-            tool,
-            result,
-            self._permission_manager,
-            self._permission_callback,
+        agent_type: str,
+        max_tool_calls: Optional[int],
+        subagent_run_id: str,
+        parent_name: Optional[str],
+    ) -> SubagentToolExecutor:
+        return SubagentToolExecutor(
+            agent_type=agent_type,
+            tool_registry=self._tool_registry,
+            is_tool_allowed=self._is_tool_allowed,
+            permission_manager=self._permission_manager,
+            permission_callback=self._permission_callback,
+            sandbox_manager=self._sandbox_manager,
+            max_tool_calls=max_tool_calls,
+            hook_runtime=self._hook_runtime,
+            hook_base=self._subagent_hook_base(agent_type, parent_name, subagent_run_id),
         )
-        return result
+
+    def _run_model_loop(
+        self,
+        messages: List[Dict],
+        display_name: str,
+        agent_type: str,
+        model_connector,
+        subagent_run_id: str,
+        tool_executor: SubagentToolExecutor,
+    ) -> Dict[str, Any]:
+        tools = self._get_allowed_tool_definitions(agent_type)
+        hook_base = getattr(tool_executor, "hook_base", None)
+        if self._hook_runtime and hook_base:
+            messages, tools, _ = self._hook_runtime.before_model_request(
+                messages,
+                tools,
+                hook_base,
+            )
+        final_output = ""
+        reasoning_output = ""
+        tool_calls: List[Dict[str, Any]] = []
+        usage = None
+        steps = 0
+        for event in model_connector.chat_to_next_loop(
+            messages=messages,
+            executor=tool_executor,
+            tools=tools,
+            interrupt_check=lambda: tool_executor.limit_reached,
+        ):
+            event_type = event.get("type", "")
+            if event_type == "answer":
+                final_output += event.get("content", "")
+            elif event_type == "thinking":
+                reasoning_output += event.get("content", "")
+            elif event_type == "tool_calls":
+                tool_calls.extend(event.get("tool_calls", []))
+            elif event_type == "usage":
+                usage = event.get("usage")
+            if event_type == "tool_result":
+                steps += 1
+            error = self._handle_loop_event(
+                event,
+                display_name,
+                subagent_run_id,
+                messages,
+                tool_executor,
+            )
+            if error:
+                return {"error": error, "output": final_output, "steps": steps}
+        if self._hook_runtime and hook_base:
+            self._hook_runtime.after_model_response(
+                {
+                    "answer_content": final_output,
+                    "reasoning_content": reasoning_output,
+                    "tool_calls": tool_calls,
+                    "usage": usage,
+                },
+                hook_base,
+            )
+        return {"error": "", "output": final_output, "steps": steps}
+
+    def _get_allowed_tool_definitions(self, agent_type: str) -> List[Dict[str, Any]]:
+        if not self._tool_registry:
+            return []
+        definitions = self._tool_registry.get_tool_definitions()
+        return [
+            tool_def
+            for tool_def in definitions
+            if self._is_tool_allowed(agent_type, str(tool_def.get("name", "")))
+        ]
+
+    def _handle_loop_event(
+        self,
+        event: Dict[str, Any],
+        display_name: str,
+        subagent_run_id: str,
+        messages: List[Dict],
+        tool_executor: SubagentToolExecutor,
+    ) -> str:
+        event_type = event.get("type", "")
+        if event_type == "answer":
+            self._emit_subagent_answer(event, display_name, subagent_run_id)
+        elif event_type == "tool_calls":
+            self._emit_subagent_tool_calls(event, display_name, subagent_run_id)
+        elif event_type == "tool_execution":
+            self._emit_subagent_tool_start(event, display_name, subagent_run_id)
+        elif event_type == "tool_result":
+            self._emit_subagent_tool_result(event, display_name, subagent_run_id)
+        return self._get_loop_error(event, tool_executor)
+
+    def _emit_subagent_answer(
+        self,
+        event: Dict[str, Any],
+        display_name: str,
+        subagent_run_id: str,
+    ) -> None:
+        self._emit_event(EventType.MODEL_ANSWER, {
+            "content": event.get("content", ""),
+            "agent_name": display_name,
+            "agent_run_id": subagent_run_id,
+        })
+
+    def _emit_subagent_tool_calls(
+        self,
+        event: Dict[str, Any],
+        display_name: str,
+        subagent_run_id: str,
+    ) -> None:
+        for tool_call in event.get("tool_calls", []):
+            func = tool_call.get("function", {})
+            self._emit_event(EventType.MODEL_TOOL_CALL, {
+                "name": func.get("name", "unknown"),
+                "arguments": func.get("arguments", {}),
+                "agent_name": display_name,
+                "agent_run_id": subagent_run_id,
+            })
+
+    def _emit_subagent_tool_start(
+        self,
+        event: Dict[str, Any],
+        display_name: str,
+        subagent_run_id: str,
+    ) -> None:
+        self._emit_event(EventType.TOOL_EXECUTION_START, {
+            "tool_name": event.get("tool_name", "unknown"),
+            "tool_call_id": event.get("tool_call_id", ""),
+            "args": event.get("args", {}),
+            "agent_name": display_name,
+            "agent_run_id": subagent_run_id,
+        })
+
+    def _emit_subagent_tool_result(
+        self,
+        event: Dict[str, Any],
+        display_name: str,
+        subagent_run_id: str,
+    ) -> None:
+        self._emit_event(EventType.TOOL_RESULT, {
+            "tool_name": event.get("tool_name", "unknown"),
+            "tool_call_id": event.get("tool_call_id", ""),
+            "result": event.get("result", ""),
+            "success": True,
+            "agent_name": display_name,
+            "agent_run_id": subagent_run_id,
+        })
+
+    def _get_loop_error(
+        self,
+        event: Dict[str, Any],
+        tool_executor: SubagentToolExecutor,
+    ) -> str:
+        event_type = event.get("type", "")
+        if event_type == "error":
+            return event.get("message", "Unknown model error")
+        if event_type == "connection_error":
+            return event.get("message", "Connection error")
+        if event_type == "interrupted" and tool_executor.limit_reached:
+            return f"Subagent reached max tool calls ({tool_executor.max_tool_calls})"
+        if event_type == "interrupted":
+            return event.get("message", "Subagent interrupted")
+        return ""
     
     def _build_system_prompt(self, agent_type: str, agent_config) -> str:
         """Build system prompt for subagent."""
@@ -514,84 +612,6 @@ class TaskTool(BaseTool):
             base_prompt = agent_config.prompt
         
         return base_prompt + "\n\nComplete the task and return a clear, concise summary."
-    
-    def _call_model(
-        self,
-        messages: List[Dict],
-        agent_name: str = None,
-        model_connector=None,
-        agent_run_id: Optional[str] = None,
-    ) -> Any:
-        """
-        Call the model with messages.
-        
-        Args:
-            messages: List of message dictionaries
-            agent_name: Agent name for display (optional)
-            model_connector: Model connector to use (defaults to self._model_connector)
-            agent_run_id: Subagent run id for display grouping (optional)
-            
-        Returns:
-            Response object with is_error, error_message, content, thinking, tool_calls
-        """
-        connector = model_connector or self._model_connector
-        if not connector or not connector._model_instance:
-            return type('Response', (), {
-                'is_error': True,
-                'error_message': 'No model available',
-                'content': '',
-                'tool_calls': []
-            })()
-        
-        try:
-            # Get tools for this subagent
-            tools = []
-            if self._tool_registry:
-                tools = self._tool_registry.get_tool_definitions()
-            
-            # Call model and collect all responses
-            full_content = ""
-            full_thinking = ""
-            all_tool_calls = []
-            is_error = False
-            error_message = ""
-            
-            for response in connector.chat(messages, tools):
-                if response.is_error:
-                    is_error = True
-                    error_message = response.error_message
-                    break
-                
-                # Accumulate content and thinking
-                if response.content:
-                    full_content += response.content
-                    # 发送 MODEL_ANSWER 事件，让前端显示子代理发言
-                    self._emit_event(EventType.MODEL_ANSWER, {
-                        "content": response.content,
-                        "agent_name": agent_name,
-                        "agent_run_id": agent_run_id,
-                    })
-                if response.thinking:
-                    full_thinking += response.thinking
-                if response.tool_calls:
-                    all_tool_calls.extend(response.tool_calls)
-            
-            # Return aggregated response
-            return type('Response', (), {
-                'is_error': is_error,
-                'error_message': error_message,
-                'content': full_content,
-                'thinking': full_thinking,
-                'tool_calls': all_tool_calls
-            })()
-            
-        except Exception as e:
-            return type('Response', (), {
-                'is_error': True,
-                'error_message': str(e),
-                'content': '',
-                'tool_calls': []
-            })()
     
     def _is_tool_allowed(self, agent_type: str, tool_name: str) -> bool:
         """Check if a tool is allowed for an agent type."""

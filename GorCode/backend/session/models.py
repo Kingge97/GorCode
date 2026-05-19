@@ -13,6 +13,7 @@ import json
 import uuid
 
 from ..utils.serialization import dataclass_from_dict, dataclass_to_dict, parse_datetime
+from ..context.token_usage import empty_token_usage_dict, normalize_usage_payload
 
 
 @dataclass
@@ -27,7 +28,13 @@ class SessionMetadata:
     model: str = "main"
     message_count: int = 0
     project_path: str = ""
+    source_session_id: str = ""
+    source_path: str = ""
+    source_kind: str = ""
+    source_agent: str = ""
+    source_model: str = ""
     tags: List[str] = field(default_factory=list)
+    token_usage: Dict[str, int] = field(default_factory=empty_token_usage_dict)
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -42,6 +49,7 @@ class SessionMetadata:
             field_deserializers={
                 "created_at": lambda value: parse_datetime(value, datetime.now()),
                 "updated_at": lambda value: parse_datetime(value, datetime.now()),
+                "token_usage": _parse_token_usage,
             },
             field_defaults={
                 "session_id": lambda: str(uuid.uuid4()),
@@ -124,6 +132,7 @@ class Session:
         """Clear all messages."""
         self.messages = []
         self.metadata.message_count = 0
+        self.metadata.token_usage = empty_token_usage_dict()
         self.metadata.updated_at = datetime.now()
     
     def to_dict(self) -> Dict[str, Any]:
@@ -199,6 +208,12 @@ class Session:
         return f"Session {self.session_id}"
 
 
+def _parse_token_usage(value: Any) -> Dict[str, int]:
+    if value is None:
+        return empty_token_usage_dict()
+    return normalize_usage_payload(value)
+
+
 @dataclass
 class SessionSearchResult:
     """Result of a session search."""
@@ -210,6 +225,12 @@ class SessionSearchResult:
     message_count: int
     agent: str
     preview: str = ""  # First user message preview
+    project_path: str = ""
+    source_session_id: str = ""
+    source_path: str = ""
+    source_kind: str = ""
+    source_agent: str = ""
+    source_model: str = ""
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""

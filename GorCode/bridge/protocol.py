@@ -43,20 +43,28 @@ PROTOCOL_DEFINITIONS = {
         "response": {"success": True, "agent": "build"},
     },
     "session.list": {
-        "request": {"limit": 10, "offset": 0},
-        "response": {"sessions": [], "total": 0},
+        "request": {"limit": 10, "offset": 0, "scope": "project"},
+        "response": {"sessions": [], "total": 0, "scope": "project"},
     },
     "session.load": {
-        "request": {"session_id": "abcd1234"},
-        "response": {"messages": [], "metadata": {}},
+        "request": {"session_id": "abcd1234", "scope": "project"},
+        "response": {"success": True, "session_id": "newid123", "messages": [], "metadata": {}, "warnings": []},
+    },
+    "session.export": {
+        "request": {"path": "history.json", "force": False},
+        "response": {"success": True, "path": "/absolute/path/history.json"},
+    },
+    "session.import": {
+        "request": {"path": "history.json"},
+        "response": {"success": True, "session_id": "newid123", "messages": [], "metadata": {}, "warnings": []},
     },
     "session.delete": {
-        "request": {"session_id": "abcd1234"},
+        "request": {"session_id": "abcd1234", "scope": "project"},
         "response": {"success": True},
     },
     "session.search": {
-        "request": {"query": "search", "limit": 10},
-        "response": {"results": []},
+        "request": {"query": "search", "limit": 10, "scope": "project"},
+        "response": {"results": [], "scope": "project"},
     },
     "debug.set": {
         "request": {"enabled": True},
@@ -69,6 +77,10 @@ PROTOCOL_DEFINITIONS = {
     "tools.init": {
         "request": {"encoding": "utf-8"},
         "response": {"success": True, "tool_count": 0},
+    },
+    "hook.status": {
+        "request": {},
+        "response": {"enabled": True, "hooks": [], "events": {}},
     },
 }
 

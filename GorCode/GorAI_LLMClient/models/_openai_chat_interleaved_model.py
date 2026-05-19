@@ -9,8 +9,17 @@ class openai_chat_interleaved_model(openai_chat_completetion_model):
     以支持带有 reasoning_content 的交错式思考处理方式
     """
     
-    def __init__(self, base_url, api_key, model_name, stream=True, extra_args=None, router=None):
-        super().__init__(base_url, api_key, model_name, stream, extra_args, router)
+    def __init__(
+        self,
+        base_url,
+        api_key,
+        model_name,
+        stream=True,
+        extra_args=None,
+        router=None,
+        hooks=None,
+    ):
+        super().__init__(base_url, api_key, model_name, stream, extra_args, router, hooks)
     
     def chatToNextLoop(self, messages, executor, encode_json=None, interrupt_check=None):
         """
@@ -47,8 +56,18 @@ class openai_chat_interleaved_model(openai_chat_completetion_model):
         # 初始化变量
         is_first_round = True  # 是否是第一轮对话
         tool_info = []  # 工具调用信息
+        loop_round = 0
+        previous_round_had_tools = False
+        hook_metadata = {}
         
         try:
+            hook_metadata = self._run_lifecycle_hooks(
+                "before_loop_start",
+                messages,
+                loop_round=loop_round,
+                previous_round_had_tools=previous_round_had_tools,
+                metadata=hook_metadata,
+            )
             # 对话循环
             while is_first_round or tool_info:
                 is_first_round = False
@@ -62,6 +81,13 @@ class openai_chat_interleaved_model(openai_chat_completetion_model):
                 # print("=" * 20 + "思考过程" + "=" * 20)
                 
                 # 调用 model_chat
+                hook_metadata = self._run_lifecycle_hooks(
+                    "before_model_request",
+                    messages,
+                    loop_round=loop_round,
+                    previous_round_had_tools=previous_round_had_tools,
+                    metadata=hook_metadata,
+                )
                 response = self.model_chat(messages)
                 
                 # 处理响应
@@ -69,6 +95,14 @@ class openai_chat_interleaved_model(openai_chat_completetion_model):
                     # 检查中断标志
                     if interrupt_check():
                         # print(f"\n检测到中断请求，停止对话")
+                        self._run_lifecycle_hooks(
+                            "on_interrupt",
+                            messages,
+                            loop_round=loop_round,
+                            previous_round_had_tools=previous_round_had_tools,
+                            tool_info=tool_info,
+                            metadata=hook_metadata,
+                        )
                         yield b"data: " + encode_json({'type': 'interrupted', 'message': '对话已被用户中断'}) + b"\n\n"
                         return
                     
@@ -76,6 +110,14 @@ class openai_chat_interleaved_model(openai_chat_completetion_model):
                     if item.gorType == "error":
                         error_msg = item.content
                         # print(f"\n模型调用错误: {error_msg}")
+                        self._run_lifecycle_hooks(
+                            "on_error",
+                            messages,
+                            loop_round=loop_round,
+                            previous_round_had_tools=previous_round_had_tools,
+                            tool_info=tool_info,
+                            metadata={**hook_metadata, "error": error_msg},
+                        )
                         yield b"data: " + encode_json({'type': 'error', 'message': error_msg}) + b"\n\n"
                         return
 
@@ -83,6 +125,14 @@ class openai_chat_interleaved_model(openai_chat_completetion_model):
                     elif item.gorType == "connection_error":
                         error_msg = item.content
                         # print(f"\n连接断开: {error_msg}")
+                        self._run_lifecycle_hooks(
+                            "on_error",
+                            messages,
+                            loop_round=loop_round,
+                            previous_round_had_tools=previous_round_had_tools,
+                            tool_info=tool_info,
+                            metadata={**hook_metadata, "error": error_msg},
+                        )
                         yield b"data: " + encode_json({
                             'type': 'connection_error',
                             'message': error_msg,
@@ -90,6 +140,9 @@ class openai_chat_interleaved_model(openai_chat_completetion_model):
                         }) + b"\n\n"
                         return
                     
+                    elif item.gorType == "usage":
+                        yield self._make_usage_sse(item, encode_json)
+
                     # 处理思考内容 (reasoning_content)
                     elif item.gorType == "think":
                         reasoning_content += item.content
@@ -120,25 +173,73 @@ class openai_chat_interleaved_model(openai_chat_completetion_model):
                     elif item.gorType == "end":
                         # print("\n" + "=" * 30 + "本次结束" + "=" * 30)
                         pass
+
+                hook_metadata = self._run_lifecycle_hooks(
+                    "after_model_response",
+                    messages,
+                    loop_round=loop_round,
+                    previous_round_had_tools=previous_round_had_tools,
+                    tool_info=tool_info,
+                    metadata={
+                        **hook_metadata,
+                        "answer_content": answer_content,
+                        "reasoning_content": reasoning_content,
+                    },
+                )
                 
                 # 如果有工具调用，执行工具并继续循环
                 if tool_info:
                     # 检查中断标志
                     if interrupt_check():
                         # print(f"\n检测到中断请求，停止工具执行")
+                        self._run_lifecycle_hooks(
+                            "on_interrupt",
+                            messages,
+                            loop_round=loop_round,
+                            previous_round_had_tools=previous_round_had_tools,
+                            tool_info=tool_info,
+                            metadata=hook_metadata,
+                        )
                         yield b"data: " + encode_json({'type': 'interrupted', 'message': '对话已被用户中断'}) + b"\n\n"
                         return
                     
                     # 执行工具调用（使用交错式思考专用的方法）
-                    yield from self._execute_tools_in_loop_interleaved(
-                        tool_info, messages, answer_content, reasoning_content, executor, encode_json, interrupt_check
+                    hook_metadata = yield from self._execute_tools_in_loop_interleaved(
+                        tool_info,
+                        messages,
+                        answer_content,
+                        reasoning_content,
+                        executor,
+                        encode_json,
+                        interrupt_check,
+                        loop_round=loop_round,
+                        previous_round_had_tools=previous_round_had_tools,
+                        metadata=hook_metadata,
                     )
+                    hook_metadata = self._run_lifecycle_hooks(
+                        "before_next_loop",
+                        messages,
+                        loop_round=loop_round,
+                        previous_round_had_tools=True,
+                        tool_info=tool_info,
+                        metadata=hook_metadata,
+                    )
+                    previous_round_had_tools = True
                 else:
                     # 没有工具调用，追加 assistant 消息到历史记录
                     # ⚠️ 关键：只追加 content，不追加 reasoning_content
                     if answer_content:
                         messages.append({'role': 'assistant', 'content': answer_content})
+                    previous_round_had_tools = False
+                loop_round += 1
             
+            self._run_lifecycle_hooks(
+                "after_loop_end",
+                messages,
+                loop_round=loop_round,
+                previous_round_had_tools=previous_round_had_tools,
+                metadata=hook_metadata,
+            )
             yield b"data: " + encode_json({'type': 'end'}) + b"\n\n"
         
         except Exception as e:
@@ -148,7 +249,20 @@ class openai_chat_interleaved_model(openai_chat_completetion_model):
             # print(traceback.format_exc())
             yield b"data: " + encode_json({'type': 'error', 'message': error_msg}) + b"\n\n"
     
-    def _execute_tools_in_loop_interleaved(self, tool_info, messages, answer_content, reasoning_content, executor, encode_json, interrupt_check):
+    def _execute_tools_in_loop_interleaved(
+        self,
+        tool_info,
+        messages,
+        answer_content,
+        reasoning_content,
+        executor,
+        encode_json,
+        interrupt_check,
+        *,
+        loop_round,
+        previous_round_had_tools,
+        metadata,
+    ):
         """
         交错式思考专用的工具执行方法
         
@@ -209,9 +323,19 @@ class openai_chat_interleaved_model(openai_chat_completetion_model):
         # 执行工具调用
         # print("工具数量：" + str(len(tool_info)))
         for tool in tool_info:
+            tool_name = tool.get("name", "unknown")
+            tool_call_id = tool.get("id", "")
             # 检查中断标志
             if interrupt_check():
                 # print(f"\n检测到中断请求，停止工具执行")
+                self._run_lifecycle_hooks(
+                    "on_interrupt",
+                    messages,
+                    loop_round=loop_round,
+                    previous_round_had_tools=previous_round_had_tools,
+                    tool_info=[tool],
+                    metadata=metadata,
+                )
                 yield b"data: " + encode_json({'type': 'interrupted', 'message': '对话已被用户中断'}) + b"\n\n"
                 return
             
@@ -231,10 +355,24 @@ class openai_chat_interleaved_model(openai_chat_completetion_model):
                     }) + b"\n\n"
                     # 添加错误结果到消息历史
                     messages.append({"role": "tool", "tool_call_id": tool.get('id', ''), "content": error_msg})
+                    metadata = self._run_lifecycle_hooks(
+                        "after_tool_execution",
+                        messages,
+                        loop_round=loop_round,
+                        previous_round_had_tools=previous_round_had_tools,
+                        tool_info=[tool],
+                        metadata={**metadata, "tool_error": error_msg},
+                    )
                     continue
-                
-                tool_name = tool["name"]
-                tool_call_id = tool["id"]
+
+                metadata = self._run_lifecycle_hooks(
+                    "before_tool_execution",
+                    messages,
+                    loop_round=loop_round,
+                    previous_round_had_tools=previous_round_had_tools,
+                    tool_info=[{**tool, "parsed_arguments": tool_args}],
+                    metadata=metadata,
+                )
                 
                 # print(f"执行工具: {tool_name}, 参数: {tool_args}")
                 
@@ -265,6 +403,14 @@ class openai_chat_interleaved_model(openai_chat_completetion_model):
                     "tool_call_id": tool_call_id,
                     "content": str(result)
                 })
+                metadata = self._run_lifecycle_hooks(
+                    "after_tool_execution",
+                    messages,
+                    loop_round=loop_round,
+                    previous_round_had_tools=previous_round_had_tools,
+                    tool_info=[{**tool, "parsed_arguments": tool_args}],
+                    metadata={**metadata, "tool_result": result},
+                )
             
             except Exception as e:
                 error_msg = f"工具执行错误: {str(e)}"
@@ -280,3 +426,12 @@ class openai_chat_interleaved_model(openai_chat_completetion_model):
                     "tool_call_id": tool_call_id,
                     "content": error_msg
                 })
+                metadata = self._run_lifecycle_hooks(
+                    "after_tool_execution",
+                    messages,
+                    loop_round=loop_round,
+                    previous_round_had_tools=previous_round_had_tools,
+                    tool_info=[tool],
+                    metadata={**metadata, "tool_error": error_msg},
+                )
+        return metadata

@@ -11,12 +11,20 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .core_tool_support.base import BaseTool, ToolResult
-from .file_tool_support.file_diff import build_structured_diff, generate_git_diff, generate_unified_diff
 from .file_tool_support.file_edit_helpers import (
     apply_line_endings,
     find_match_text,
-    maybe_deserialize,
     normalize_trailing_whitespace,
+)
+from .file_tool_support.file_edit_preconditions import (
+    validate_edit_preconditions,
+)
+from .file_tool_support.file_edit_preview import (
+    MatchValidation,
+    build_edit_preview,
+    multiple_match_error,
+    prepare_edit_text,
+    read_edit_content,
 )
 from .file_tool_support.file_io import write_text_file
 from .file_tool_support.file_read_helpers import check_file_size
@@ -26,13 +34,11 @@ from .file_tool_support.file_utils import detect_line_ending
 from .core_tool_support.path_validation import resolve_and_validate_path
 from .core_tool_support.tool_utils import (
     build_parameters_schema,
-    build_permission_preview_result,
     resolve_encoding,
     tool_error_result,
 )
 from ..lsp import LspManager
 from ..platform.detector import get_platform_info
-from ..platform.encoding import read_text_with_fallback
 
 
 class EditTool(BaseTool):
@@ -64,99 +70,83 @@ class EditTool(BaseTool):
         replace_all: bool = False,
         encoding: str = None,
     ) -> ToolResult:
-        """
-        Edit file by replacing text.
-
-        Args:
-            file_path: Path to the file to edit
-            old_text: Text to find and replace
-            new_text: Text to replace with
-            replace_all: Replace all occurrences if True
-            encoding: File encoding
-
-        Returns:
-            ToolResult with edit status and permission metadata
-        """
+        """Edit file by replacing text."""
         try:
             path, validation_error = resolve_and_validate_path(file_path, "file")
             if validation_error:
                 return validation_error
-
             size_error = check_file_size(path, self._settings, check_read_limit=False)
             if size_error:
                 return size_error
-
-            precheck_error = _validate_preconditions(path, self._file_state_cache, self._settings)
-            if precheck_error:
-                return precheck_error
-
             enc = resolve_encoding(encoding, self.default_encoding)
-            content = read_text_with_fallback(path, enc)
-            if content is None:
-                return ToolResult(
-                    success=False,
-                    output="",
-                    error=f"Failed to read file with encoding: {enc}",
-                )
-
-            prepared_old = maybe_deserialize(old_text, self._settings.edit_deserialize)
-            prepared_new = maybe_deserialize(new_text, self._settings.edit_deserialize)
-
-            match = find_match_text(content, prepared_old, self._settings)
-            if not match:
-                return ToolResult(
-                    success=False,
-                    output="",
-                    error=f"Text not found in file: {prepared_old[:100]}...",
-                )
-
-            if match.occurrences > 1 and not replace_all:
-                return ToolResult(
-                    success=False,
-                    output="",
-                    error=(
-                        f"Multiple matches found ({match.occurrences}). "
-                        "Set replace_all=true or provide unique text."
-                    ),
-                    metadata={
-                        "occurrences_found": match.occurrences,
-                    },
-                )
-
+            prepared = prepare_edit_text(old_text, new_text, self._settings)
+            precheck = self._validate_edit_precheck(path, prepared[0], replace_all)
+            if precheck.error:
+                return precheck.error
+            content_result = read_edit_content(path, enc)
+            if content_result.error:
+                return content_result.error
+            match_result = self._validate_match(content_result.content, prepared[0], replace_all, precheck)
+            if match_result.error:
+                return match_result.error
+            match = match_result.match
             replace_count = match.occurrences if replace_all else 1
-            new_content = content.replace(match.match_text, prepared_new, replace_count)
-            line_ending = _resolve_line_ending(content, self._settings)
+            new_content = content_result.content.replace(match.match_text, prepared[1], replace_count)
+            line_ending = _resolve_line_ending(content_result.content, self._settings)
             new_content = _normalize_new_content(new_content, line_ending, path, self._settings)
-
-            if new_content == content:
+            if new_content == content_result.content:
                 return ToolResult(
                     success=False,
                     output="",
                     error="Edit is a no-op; content unchanged",
                 )
-
-            diff = generate_unified_diff(content, new_content, str(path))
-            git_diff = generate_git_diff(content, new_content, str(path))
-            structured = build_structured_diff(content, new_content)
-
-            return build_permission_preview_result(
-                f"Ready to replace {replace_count} occurrence(s) in {file_path}",
-                {
-                    "file_path": str(path),
-                    "occurrences_found": match.occurrences,
-                    "occurrences_to_replace": replace_count,
-                    "matched_text": match.match_text,
-                    "diff": diff,
-                    "git_diff": git_diff,
-                    "structured_diff": structured,
-                    "line_ending": line_ending,
-                    "new_content": new_content,
-                    "encoding": resolve_encoding(encoding, self.default_encoding),
-                },
+            return build_edit_preview(
+                file_path,
+                path,
+                content_result.content,
+                new_content,
+                match,
+                replace_count,
+                line_ending,
+                enc,
             )
-
         except Exception as exc:
             return tool_error_result(exc)
+
+    def _validate_edit_precheck(
+        self,
+        path: Path,
+        old_text: str,
+        replace_all: bool,
+    ):
+        return validate_edit_preconditions(
+            path,
+            self._file_state_cache,
+            self._settings,
+            old_text,
+            replace_all,
+        )
+
+    def _validate_match(
+        self,
+        content: str,
+        old_text: str,
+        replace_all: bool,
+        precheck,
+    ):
+        match = find_match_text(content, old_text, self._settings)
+        if not match:
+            error = ToolResult(success=False, output="", error=f"Text not found in file: {old_text[:100]}...")
+            return MatchValidation(error, None)
+        if match.occurrences > 1 and not replace_all:
+            error = ToolResult(
+                success=False,
+                output="",
+                error=multiple_match_error(match.occurrences, precheck.snapshot_kind),
+                metadata={"occurrences_found": match.occurrences},
+            )
+            return MatchValidation(error, None)
+        return MatchValidation(None, match)
 
     def execute_with_permission(
         self,
@@ -235,41 +225,6 @@ class EditTool(BaseTool):
             },
             required=["file_path", "old_text", "new_text"],
         )
-
-
-def _validate_preconditions(
-    path: Path,
-    cache: Optional[FileStateCache],
-    settings: FileToolSettings,
-) -> Optional[ToolResult]:
-    if settings.enforce_read_before_write:
-        if not cache or not cache.has_full_read(path):
-            return ToolResult(
-                success=False,
-                output="",
-                error="Edit requires a full ReadTool snapshot first",
-            )
-    if settings.enforce_mtime_check:
-        if not cache:
-            return ToolResult(
-                success=False,
-                output="",
-                error="File state cache not available for mtime check",
-            )
-        state = cache.get_state(path)
-        if not state:
-            return ToolResult(
-                success=False,
-                output="",
-                error="Missing file state for mtime check",
-            )
-        if cache.is_modified_since(path, state):
-            return ToolResult(
-                success=False,
-                output="",
-                error="File modified since last read; aborting edit",
-            )
-    return None
 
 
 def _resolve_line_ending(content: str, settings: FileToolSettings) -> str:

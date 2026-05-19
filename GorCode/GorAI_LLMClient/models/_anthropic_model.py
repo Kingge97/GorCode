@@ -2,10 +2,20 @@ import json
 from anthropic import Anthropic, APIConnectionError, APITimeoutError
 from ._model_base import model_base
 from ..message._message_base import MsgReturn
+from ..message._usage import make_usage_message, normalize_anthropic_usage
 
 class anthropic_model(model_base):
-    def __init__(self, base_url, api_key, model_name, stream=True, extra_args=None, router=None):
-        super().__init__(base_url, api_key, model_name, stream, extra_args, router)
+    def __init__(
+        self,
+        base_url,
+        api_key,
+        model_name,
+        stream=True,
+        extra_args=None,
+        router=None,
+        hooks=None,
+    ):
+        super().__init__(base_url, api_key, model_name, stream, extra_args, router, hooks)
         # 初始化Anthropic客户端
         self.client = Anthropic(
             base_url=self.base_url,
@@ -142,12 +152,17 @@ class anthropic_model(model_base):
         tool_calls = []
         current_tool_call = None
         current_content_type = None  # 当前内容块类型："thinking" 或 "text"
+        usage_input_tokens = None
+        usage_output_tokens = None
 
         for chunk in response:
             # print(chunk)
             if chunk.type == "message_start":
                 # 消息开始
-                pass
+                usage = getattr(getattr(chunk, "message", None), "usage", None)
+                value = self._read_usage_value(usage, "input_tokens")
+                if value is not None:
+                    usage_input_tokens = value
             elif chunk.type == "content_block_start":
                 # 内容块开始
                 if chunk.content_block.type == "tool_use":
@@ -219,7 +234,10 @@ class anthropic_model(model_base):
                 current_content_type = None
             elif chunk.type == "message_delta":
                 # 消息增量（通常包含usage信息）
-                pass
+                usage = getattr(chunk, "usage", None)
+                value = self._read_usage_value(usage, "output_tokens")
+                if value is not None:
+                    usage_output_tokens = value
             elif chunk.type == "message_stop":
                 # 消息结束
                 pass
@@ -234,6 +252,13 @@ class anthropic_model(model_base):
                     extra={"tool_call": tool_call},
                     default_response=None
                 )
+
+        if usage_input_tokens is not None and usage_output_tokens is not None:
+            usage = normalize_anthropic_usage({
+                "input_tokens": usage_input_tokens,
+                "output_tokens": usage_output_tokens,
+            })
+            yield make_usage_message(usage, default_response=None)
 
         # 返回结束标志
         yield MsgReturn(
@@ -307,6 +332,10 @@ class anthropic_model(model_base):
                     default_response=response
                 )
 
+        if hasattr(response, "usage") and response.usage:
+            usage = normalize_anthropic_usage(response.usage)
+            yield make_usage_message(usage, default_response=response)
+
         # 返回结束标志
         yield MsgReturn(
             content="",
@@ -315,3 +344,10 @@ class anthropic_model(model_base):
             extra={"message": response},
             default_response=response
         )
+
+    def _read_usage_value(self, usage, field_name):
+        if not usage:
+            return None
+        if isinstance(usage, dict):
+            return usage.get(field_name)
+        return getattr(usage, field_name, None)

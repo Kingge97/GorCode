@@ -2,10 +2,20 @@ import json
 from openai import OpenAI, APIConnectionError, APITimeoutError
 from ._model_base import model_base
 from ..message._message_base import MsgReturn
+from ..message._usage import make_usage_message, normalize_openai_chat_usage
 
 class openai_chat_completetion_model(model_base):
-    def __init__(self, base_url, api_key, model_name, stream=True, extra_args=None, router=None):
-        super().__init__(base_url, api_key, model_name, stream, extra_args, router)
+    def __init__(
+        self,
+        base_url,
+        api_key,
+        model_name,
+        stream=True,
+        extra_args=None,
+        router=None,
+        hooks=None,
+    ):
+        super().__init__(base_url, api_key, model_name, stream, extra_args, router, hooks)
         self.client = OpenAI(
             base_url=self.base_url,
             api_key=self.api_key
@@ -60,13 +70,19 @@ class openai_chat_completetion_model(model_base):
 
     def _handle_stream_response(self, request_params):
         """处理流式响应"""
-        response = self.client.chat.completions.create(**request_params)
+        response = self.client.chat.completions.create(
+            **self._with_usage_stream_options(request_params)
+        )
 
         reasoning_content = ""
         content = ""
         tool_calls_dict = {}  # 使用字典按index追踪每个工具，避免并行工具调用时名称拼接错误
+        usage = None
 
         for chunk in response:
+            if hasattr(chunk, "usage") and chunk.usage:
+                usage = normalize_openai_chat_usage(chunk.usage)
+
             if chunk.choices:
                 choice = chunk.choices[0]
                 delta = choice.delta
@@ -136,6 +152,9 @@ class openai_chat_completetion_model(model_base):
                     default_response=None
                 )
 
+        if usage:
+            yield make_usage_message(usage, default_response=None)
+
         # 返回结束标志
         yield MsgReturn(
             content="",
@@ -185,6 +204,10 @@ class openai_chat_completetion_model(model_base):
                     default_response=response
                 )
 
+        if hasattr(response, "usage") and response.usage:
+            usage = normalize_openai_chat_usage(response.usage)
+            yield make_usage_message(usage, default_response=response)
+
         # 返回结束标志
         yield MsgReturn(
             content="",
@@ -193,4 +216,10 @@ class openai_chat_completetion_model(model_base):
             extra={"message": message},
             default_response=response
         )
+
+    def _with_usage_stream_options(self, request_params):
+        """启用 OpenAI Chat 流式 usage，同时保留调用方已有 stream_options。"""
+        stream_options = dict(request_params.get("stream_options") or {})
+        stream_options["include_usage"] = True
+        return {**request_params, "stream_options": stream_options}
 

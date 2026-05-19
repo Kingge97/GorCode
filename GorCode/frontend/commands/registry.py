@@ -36,9 +36,11 @@ COMMAND_SPECS: Tuple[CommandSpec, ...] = (
         ("history",),
         "_cmd_history",
         (
-            ("/history list", "List session history"),
-            ("/history load <id>", "Load a session from history"),
-            ("/history search <query>", "Search session history"),
+            ("/history list [--all]", "List current-project session history"),
+            ("/history load <id> [--all]", "Clone a session from history"),
+            ("/history load path <file>", "Import a saved session file"),
+            ("/history save <file> [--force]", "Export the current session"),
+            ("/history search <query> [--all]", "Search session history"),
         ),
     ),
     CommandSpec((
@@ -55,5 +57,11 @@ COMMAND_SPECS: Tuple[CommandSpec, ...] = (
         "_cmd_permission",
         (("/permission [status|grant|revoke|clear]", "Manage session permissions"),),
     ),
+    CommandSpec(
+        ("sandbox",),
+        "_cmd_sandbox",
+        (("/sandbox [status|on|off|reload]", "Manage sandbox boundary checks"),),
+    ),
+    CommandSpec(("hook",), "_cmd_hook", (("/hook status", "Show hook status"),)),
     CommandSpec(("exit", "quit"), "_cmd_exit", (("/exit", "Exit GorCode"),)),
 )

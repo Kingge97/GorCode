@@ -72,12 +72,15 @@ def print_goodbye():
     console.print()
 
 
-def _get_current_agent(client: FrontendClient) -> str:
-    """Get current agent name for prompt display."""
+def _get_current_prompt_label(client: FrontendClient) -> str:
+    """Get current agent/model label for prompt display."""
     resp = client.request("session.status")
     if resp.get("success"):
-        return resp.get("payload", {}).get("agent") or "build"
-    return "build"
+        payload = resp.get("payload", {})
+        agent = payload.get("agent") or "build"
+        model = payload.get("model") or "main"
+        return f"[{agent}][{model}]"
+    return "[build][main]"
 
 
 def _has_valid_model_connections(config: dict) -> bool:
@@ -171,6 +174,13 @@ def _connect_first_model_or_warn(config: dict, client: FrontendClient) -> None:
     show_default=True,
     help="Permission profile (ask/all/exceptrm)",
 )
+@click.option(
+    "--sandbox",
+    type=click.Choice(["default", "on", "off"], case_sensitive=False),
+    default="default",
+    show_default=True,
+    help="Sandbox profile (default/on/off)",
+)
 @click.pass_context
 def cli(
     ctx: click.Context,
@@ -182,6 +192,7 @@ def cli(
     prompt: Optional[str],
     mcps: tuple,
     permission: str,
+    sandbox: str,
 ):
     """
     GorCode - AI-Powered CLI Coding Assistant
@@ -203,6 +214,7 @@ def cli(
             prompt=prompt,
             mcps=mcps,
             permission=permission,
+            sandbox=sandbox,
         )
 
 
@@ -224,6 +236,13 @@ def cli(
     show_default=True,
     help="Permission profile (ask/all/exceptrm)",
 )
+@click.option(
+    "--sandbox",
+    type=click.Choice(["default", "on", "off"], case_sensitive=False),
+    default="default",
+    show_default=True,
+    help="Sandbox profile (default/on/off)",
+)
 def run(
     debug: bool,
     config_path: Optional[str],
@@ -232,6 +251,7 @@ def run(
     prompt: Optional[str],
     mcps: tuple,
     permission: str,
+    sandbox: str,
 ):
     """Run GorCode in interactive mode."""
     runtime = create_inprocess_client(config_path=config_path)
@@ -280,6 +300,12 @@ def run(
             if permission_value == "all":
                 client.request("permission.grant", {"type": "bash_delete"})
 
+    if sandbox and sandbox.lower() != "default":
+        request_type = "sandbox.enable" if sandbox.lower() == "on" else "sandbox.disable"
+        response = client.request(request_type, {})
+        if not response.get("success"):
+            console.print(f"[red]Failed to set sandbox: {response.get('error', 'unknown')}[/red]")
+
     def reconnect_callback(error_message: str) -> str:
         """
         Reconnect callback for UI interaction.
@@ -321,6 +347,9 @@ def run(
         if not agent_resp.get("success"):
             # Fallback: if agent switch fails, try to connect to first available model
             _connect_first_model_or_warn(config, client)
+        elif agent_resp.get("payload", {}).get("model_switch_failed"):
+            target_model = agent_resp.get("payload", {}).get("target_model")
+            console.print(f"[yellow]Warning: Failed to connect to model '{target_model}'[/yellow]")
     else:
         # Agent not found in registry, fallback to old behavior
         client.request("agent.set", {"agent": agent})
@@ -353,7 +382,7 @@ def run(
         try:
             # Get user input
             user_input = session.prompt(
-                f"[{_get_current_agent(client)}]> ",
+                f"{_get_current_prompt_label(client)}> ",
                 multiline=False,
             ).strip()
             

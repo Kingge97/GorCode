@@ -76,8 +76,18 @@ class anthropic_interleaved_model(anthropic_model):
         # 初始化变量
         is_first_round = True  # 是否是第一轮对话
         has_tool_calls = True  # 是否有工具调用
+        loop_round = 0
+        previous_round_had_tools = False
+        hook_metadata = {}
         
         try:
+            hook_metadata = self._run_lifecycle_hooks(
+                "before_loop_start",
+                messages,
+                loop_round=loop_round,
+                previous_round_had_tools=previous_round_had_tools,
+                metadata=hook_metadata,
+            )
             # 对话循环
             while is_first_round or has_tool_calls:
                 is_first_round = False
@@ -92,6 +102,13 @@ class anthropic_interleaved_model(anthropic_model):
                 # print("=" * 20 + "思考过程" + "=" * 20)
                 
                 # 调用 model_chat
+                hook_metadata = self._run_lifecycle_hooks(
+                    "before_model_request",
+                    messages,
+                    loop_round=loop_round,
+                    previous_round_had_tools=previous_round_had_tools,
+                    metadata=hook_metadata,
+                )
                 response = self.model_chat(messages)
                 
                 # 处理响应，收集所有内容块
@@ -99,6 +116,14 @@ class anthropic_interleaved_model(anthropic_model):
                     # 检查中断标志
                     if interrupt_check():
                         # print(f"\n检测到中断请求，停止对话")
+                        self._run_lifecycle_hooks(
+                            "on_interrupt",
+                            messages,
+                            loop_round=loop_round,
+                            previous_round_had_tools=previous_round_had_tools,
+                            tool_info=tool_use_blocks,
+                            metadata=hook_metadata,
+                        )
                         yield b"data: " + encode_json({'type': 'interrupted', 'message': '对话已被用户中断'}) + b"\n\n"
                         return
                     
@@ -106,6 +131,14 @@ class anthropic_interleaved_model(anthropic_model):
                     if item.gorType == "error":
                         error_msg = item.content
                         # print(f"\n模型调用错误: {error_msg}")
+                        self._run_lifecycle_hooks(
+                            "on_error",
+                            messages,
+                            loop_round=loop_round,
+                            previous_round_had_tools=previous_round_had_tools,
+                            tool_info=tool_use_blocks,
+                            metadata={**hook_metadata, "error": error_msg},
+                        )
                         yield b"data: " + encode_json({'type': 'error', 'message': error_msg}) + b"\n\n"
                         return
 
@@ -113,6 +146,14 @@ class anthropic_interleaved_model(anthropic_model):
                     elif item.gorType == "connection_error":
                         error_msg = item.content
                         # print(f"\n连接断开: {error_msg}")
+                        self._run_lifecycle_hooks(
+                            "on_error",
+                            messages,
+                            loop_round=loop_round,
+                            previous_round_had_tools=previous_round_had_tools,
+                            tool_info=tool_use_blocks,
+                            metadata={**hook_metadata, "error": error_msg},
+                        )
                         yield b"data: " + encode_json({
                             'type': 'connection_error',
                             'message': error_msg,
@@ -120,6 +161,9 @@ class anthropic_interleaved_model(anthropic_model):
                         }) + b"\n\n"
                         return
                     
+                    elif item.gorType == "usage":
+                        yield self._make_usage_sse(item, encode_json)
+
                     # 处理思考内容
                     elif item.gorType == "think":
                         thinking_content += item.content
@@ -171,12 +215,33 @@ class anthropic_interleaved_model(anthropic_model):
                         "name": tool_call['function']['name'],
                         "input": json.loads(tool_call['function']['arguments'])
                     })
+
+                hook_metadata = self._run_lifecycle_hooks(
+                    "after_model_response",
+                    messages,
+                    loop_round=loop_round,
+                    previous_round_had_tools=previous_round_had_tools,
+                    tool_info=tool_use_blocks,
+                    metadata={
+                        **hook_metadata,
+                        "answer_content": answer_content,
+                        "reasoning_content": thinking_content,
+                    },
+                )
                 
                 # 如果有工具调用，执行工具并继续循环
                 if tool_use_blocks:
                     # 检查中断标志
                     if interrupt_check():
                         # print(f"\n检测到中断请求，停止工具执行")
+                        self._run_lifecycle_hooks(
+                            "on_interrupt",
+                            messages,
+                            loop_round=loop_round,
+                            previous_round_had_tools=previous_round_had_tools,
+                            tool_info=tool_use_blocks,
+                            metadata=hook_metadata,
+                        )
                         yield b"data: " + encode_json({'type': 'interrupted', 'message': '对话已被用户中断'}) + b"\n\n"
                         return
                     
@@ -199,10 +264,28 @@ class anthropic_interleaved_model(anthropic_model):
                     yield b"data: " + encode_json({'type': 'tool_calls', 'tool_calls': tool_calls_for_frontend}) + b"\n\n"
                     
                     # 执行工具调用（使用交错式思考/Anthropic 风格）
-                    yield from self._execute_tools_interleaved_style(tool_use_blocks, messages, executor, encode_json, interrupt_check)
+                    hook_metadata = yield from self._execute_tools_interleaved_style(
+                        tool_use_blocks,
+                        messages,
+                        executor,
+                        encode_json,
+                        interrupt_check,
+                        loop_round=loop_round,
+                        previous_round_had_tools=previous_round_had_tools,
+                        metadata=hook_metadata,
+                    )
+                    hook_metadata = self._run_lifecycle_hooks(
+                        "before_next_loop",
+                        messages,
+                        loop_round=loop_round,
+                        previous_round_had_tools=True,
+                        tool_info=tool_use_blocks,
+                        metadata=hook_metadata,
+                    )
                     
                     # 继续循环
                     has_tool_calls = True
+                    previous_round_had_tools = True
                 else:
                     # 没有工具调用，循环结束
                     has_tool_calls = False
@@ -213,7 +296,16 @@ class anthropic_interleaved_model(anthropic_model):
                             'role': 'assistant',
                             'content': answer_content
                         })
+                    previous_round_had_tools = False
+                loop_round += 1
             
+            self._run_lifecycle_hooks(
+                "after_loop_end",
+                messages,
+                loop_round=loop_round,
+                previous_round_had_tools=previous_round_had_tools,
+                metadata=hook_metadata,
+            )
             yield b"data: " + encode_json({'type': 'end'}) + b"\n\n"
         
         except Exception as e:
@@ -223,7 +315,18 @@ class anthropic_interleaved_model(anthropic_model):
             # print(traceback.format_exc())
             yield b"data: " + encode_json({'type': 'error', 'message': error_msg}) + b"\n\n"
     
-    def _execute_tools_interleaved_style(self, tool_use_blocks, messages, executor, encode_json, interrupt_check):
+    def _execute_tools_interleaved_style(
+        self,
+        tool_use_blocks,
+        messages,
+        executor,
+        encode_json,
+        interrupt_check,
+        *,
+        loop_round,
+        previous_round_had_tools,
+        metadata,
+    ):
         """
         以交错式思考/Anthropic 风格执行工具调用并更新消息历史
         
@@ -246,11 +349,22 @@ class anthropic_interleaved_model(anthropic_model):
         
         # 执行所有工具调用
         tool_results = []
+        after_tool_events = []
         
         for tool in tool_use_blocks:
+            tool_name = tool["function"].get("name", "unknown")
+            tool_call_id = tool.get("id", "")
             # 检查中断标志
             if interrupt_check():
                 # print(f"\n检测到中断请求，停止工具执行")
+                self._run_lifecycle_hooks(
+                    "on_interrupt",
+                    messages,
+                    loop_round=loop_round,
+                    previous_round_had_tools=previous_round_had_tools,
+                    tool_info=[tool],
+                    metadata=metadata,
+                )
                 yield b"data: " + encode_json({'type': 'interrupted', 'message': '对话已被用户中断'}) + b"\n\n"
                 return
             
@@ -275,10 +389,17 @@ class anthropic_interleaved_model(anthropic_model):
                         "tool_use_id": tool.get('id', ''),
                         "content": error_msg
                     })
+                    after_tool_events.append((tool, {"tool_error": error_msg}))
                     continue
-                
-                tool_name = tool["function"]["name"]
-                tool_call_id = tool["id"]
+
+                metadata = self._run_lifecycle_hooks(
+                    "before_tool_execution",
+                    messages,
+                    loop_round=loop_round,
+                    previous_round_had_tools=previous_round_had_tools,
+                    tool_info=[{**tool, "parsed_arguments": tool_args}],
+                    metadata=metadata,
+                )
                 
                 # print(f"执行工具: {tool_name}, 参数: {tool_args}")
                 
@@ -309,6 +430,10 @@ class anthropic_interleaved_model(anthropic_model):
                     "tool_use_id": tool_call_id,
                     "content": str(result)
                 })
+                after_tool_events.append((
+                    {**tool, "parsed_arguments": tool_args},
+                    {"tool_result": result},
+                ))
             
             except Exception as e:
                 error_msg = f"工具执行错误: {str(e)}"
@@ -326,9 +451,20 @@ class anthropic_interleaved_model(anthropic_model):
                     "tool_use_id": tool_call_id,
                     "content": error_msg
                 })
+                after_tool_events.append((tool, {"tool_error": error_msg}))
         
         # ⚠️ 交错式思考关键：以 user 角色 + tool_result 块数组的形式追加工具结果
         messages.append({
             "role": "user",
             "content": tool_results
         })
+        for tool, event_metadata in after_tool_events:
+            metadata = self._run_lifecycle_hooks(
+                "after_tool_execution",
+                messages,
+                loop_round=loop_round,
+                previous_round_had_tools=previous_round_had_tools,
+                tool_info=[tool],
+                metadata={**metadata, **event_metadata},
+            )
+        return metadata

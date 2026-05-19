@@ -76,47 +76,89 @@ def build_text_result(
     lines = content.splitlines()
     total_lines = len(lines)
     sliced = slice_lines(lines, offset, limit)
+    snapshot_text = content if offset <= 0 and limit is None else "\n".join(sliced)
     if line_numbers:
         sliced = add_line_numbers(sliced, start=offset + 1)
     result_text = "\n".join(sliced)
     token_limit_error = check_token_limit(result_text, max_tokens)
     if token_limit_error:
         return token_limit_error
-
     result_text = truncate_output(result_text)
-
     line_ending = detect_line_ending(content, "\n")
     is_partial = offset > 0 or limit is not None
-    modified_since_last_read = False
-    if cache:
-        previous_state = cache.get_state(path)
-        if previous_state:
-            modified_since_last_read = cache.is_modified_since(path, previous_state)
-    if cache:
-        cache.snapshot_read(
-            path,
-            content,
-            encoding,
-            is_partial=is_partial,
-            offset=offset,
-            limit=limit,
-            line_ending=line_ending,
-        )
+    modified = snapshot_read_result(
+        cache,
+        path,
+        snapshot_text,
+        encoding,
+        is_partial=is_partial,
+        offset=offset,
+        limit=limit,
+        line_ending=line_ending,
+    )
+    metadata = build_read_metadata(
+        path,
+        total_lines,
+        len(sliced),
+        encoding,
+        line_numbers,
+        deduped,
+        is_partial,
+        modified,
+    )
+    if extra_metadata:
+        metadata.update(extra_metadata)
+    return ToolResult(success=True, output=result_text, metadata=metadata)
 
-    metadata = {
+
+def snapshot_read_result(
+    cache: Optional[FileStateCache],
+    path: Path,
+    snapshot_text: str,
+    encoding: str,
+    *,
+    is_partial: bool,
+    offset: int,
+    limit: Optional[int],
+    line_ending: str,
+) -> bool:
+    if not cache:
+        return False
+    previous_state = cache.get_state(path)
+    modified = cache.is_modified_since(path, previous_state) if previous_state else False
+    cache.snapshot_read(
+        path,
+        snapshot_text,
+        encoding,
+        is_partial=is_partial,
+        offset=offset,
+        limit=limit,
+        line_ending=line_ending,
+    )
+    return modified
+
+
+def build_read_metadata(
+    path: Path,
+    total_lines: int,
+    returned_lines: int,
+    encoding: str,
+    line_numbers: bool,
+    deduped: bool,
+    is_partial: bool,
+    modified: bool,
+) -> Dict[str, Any]:
+    return {
         "file_path": str(path),
         "total_lines": total_lines,
-        "returned_lines": len(sliced),
+        "total_lines_known": True,
+        "returned_lines": returned_lines,
         "encoding": encoding,
         "line_numbers": line_numbers,
         "deduped": deduped,
         "is_partial_view": is_partial,
-        "modified_since_last_read": modified_since_last_read,
+        "modified_since_last_read": modified,
     }
-    if extra_metadata:
-        metadata.update(extra_metadata)
-
-    return ToolResult(success=True, output=result_text, metadata=metadata)
 
 
 def slice_lines(lines: List[str], offset: int, limit: Optional[int]) -> List[str]:

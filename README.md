@@ -1,310 +1,412 @@
 # GorCode
 
-> An AI-Powered CLI Coding Assistant with Multi-Provider Support and Hierarchical Agent System
+> A practical CLI coding assistant with multi-model configuration, agents, MCP tools, skills, permissions, sandbox checks, and configurable context compression.
 
 [![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-## Overview
+GorCode is a command-line AI coding assistant. It lets you connect one or more LLM providers, choose different agents for different kinds of work, attach MCP tools, load project skills, and manage long coding sessions from the terminal.
 
-**GorCode** is an intelligent CLI coding assistant that revolutionizes developer workflows through its powerful multi-provider LLM support and sophisticated hierarchical agent architecture. Built for developers who demand flexibility, extensibility, and intelligent code assistance.
+This README focuses on first-time setup and day-to-day usage. Internal architecture details are intentionally kept short.
 
-## Key Features
+## Install
 
-### Multi-Provider LLM Support
-
-GorCode seamlessly integrates with multiple LLM providers through a unified interface:
-
-| Provider | Router | Features |
-|----------|--------|----------|
-| OpenAI | `openai-chat` | GPT-4, GPT-3.5, streaming support |
-| Anthropic | `anthropic` | Claude 3.5/3.7 Sonnet, extended thinking |
-| OpenAI Interleaved | `openai-chat-interleaved` | OpenAI with interleaved content |
-| Anthropic Interleaved | `anthropic-interleaved` | Anthropic with interleaved content |
-| OpenAI Responses | `openai-response` | OpenAI Responses API |
-
-**Multiple routers can work simultaneously**, allowing you to leverage different models for different tasks within the same session.
-
-### Hierarchical Multi-Agent System
-
-GorCode features a powerful multi-level agent architecture:
-
-```
-┌─────────────────────────────────────────┐
-│           Primary Agent                 │
-│    (build, plan - Main Orchestrators)   │
-└─────────────────┬───────────────────────┘
-                  │
-        ┌─────────┼─────────┐
-        ▼         ▼         ▼
-┌───────────┐ ┌───────────┐ ┌───────────┐
-│ Sub-Agent │ │ Sub-Agent │ │ Sub-Agent │
-│ (explore) │ │ (general) │ │ (custom)  │
-└─────┬─────┘ └───────────┘ └───────────┘
-      │
-      ▼
-┌───────────┐
-│  Sub-Sub  │  ← Agents can spawn more agents!
-│   Agent   │
-└───────────┘
-```
-
-**Agent Hierarchy Features:**
-- **Primary Agents**: Main orchestrators (`build`, `plan`) that handle complex tasks
-- **Sub-Agents**: Specialized workers (`explore`, `general`) for focused subtasks
-- **Recursive Delegation**: Any agent can spawn sub-agents for parallel task execution
-- **Custom Agents**: Define your own agents with custom prompts and capabilities
-
-### Customizable Agent Configuration
-
-Agents are fully customizable through Markdown-based configuration:
-
-```markdown
----
-name: my-custom-agent
-mode: subagent
-description: Specialized agent for database operations
-allowsubagents: ["explore", "general"]
-tools:
-  search_codebase: true
-  file_tools: true
-permissions:
-  edit: allow
-  bash:
-    "*": ask
----
-
-# Custom System Prompt
-
-You are a specialized database optimization agent...
-```
-
-### MCP (Model Context Protocol) Support
-
-GorCode supports the Model Context Protocol for extended capabilities:
-
-- **Tool Discovery**: Automatically discover and use tools from MCP servers
-- **Resource Access**: Access external resources through standardized protocols
-- **Multiple Servers**: Connect to multiple MCP servers simultaneously
-- **Claude Code Compatible**: Compatible with Claude Code MCP configurations
-
-### Skill System
-
-Inject specialized knowledge into conversations:
-
-- **Skill Directories**: Organize knowledge in `.gorcode/skills/`
-- **YAML Frontmatter**: Define skill metadata with YAML
-- **Resource Embedding**: Include code examples, documentation, and templates
-- **Dynamic Injection**: Skills are injected into context when needed
-
-### Additional Features
-
-- **Streaming Responses**: Real-time response streaming with thinking visibility
-- **Tool Calling**: Built-in tools for file operations, code search, web fetching
-- **Context Management**: Intelligent context compaction and summarization
-- **Permission System**: Configurable permission levels for sensitive operations
-- **Session Persistence**: Save and resume conversations
-
-## Installation
-
-### 1. Clone the Repository
+The commands below are run from the `GorCode/` Python project directory inside the repository.
 
 ```bash
 git clone https://github.com/Kingge97/GorCode.git
 cd GorCode/GorCode
 ```
 
-### 2. Install Dependencies
+Install runtime dependencies:
 
-**Option A: Using requirements.txt (Recommended for users)**
 ```bash
-# Install dependencies from requirements.txt
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-**Option B: Using pip install -e (Recommended for developers)**
-```bash
-# Install in editable mode
-pip install -e .
+Install the `gorcode` command and create the default user configuration:
 
-# Or install with development dependencies
-pip install -e ".[dev]"
-```
+Windows PowerShell:
 
-### 3. Setup CLI Command (Optional)
-
-Run the setup script to add `gorcode` command to your PATH:
-
-**Windows (PowerShell):**
 ```powershell
 .\scripts\setup-gorcode.ps1
 ```
 
-**macOS/Linux:**
+macOS / Linux:
+
 ```bash
 bash scripts/setup-gorcode.sh
 ```
 
-After running the script, open a new terminal and you can use the `gorcode` command directly.
+Open a new terminal after running the setup script, then check:
+
+```bash
+gorcode --help
+```
+
+If you do not want to install the shell command yet, you can run GorCode from the project directory:
+
+```bash
+python run_gorcode.py --help
+```
 
 ## Quick Start
 
-### 1. Configure Models
+1. Create or refresh the default configuration:
 
-Create `~/.gorcode/config.json`:
+```bash
+gorcode init --user-only
+```
+
+2. Edit the user config:
+
+```text
+~/.gorcode/config.json
+```
+
+3. Add at least one model connection:
 
 ```json
 {
-  "models": {
-    "claude": {
-      "name": "claude",
-      "model_name": "claude-3-5-sonnet-20241022",
-      "base_url": "https://api.anthropic.com/v1/",
-      "api_key": "your-anthropic-api-key",
-      "router": "anthropic",
-      "stream": true
-    },
-    "gpt4": {
-      "name": "gpt4",
-      "model_name": "gpt-4-turbo",
-      "base_url": "https://api.openai.com/v1/",
-      "api_key": "your-openai-api-key",
+  "model_connections": {
+    "main": {
+      "name": "main",
+      "base_url": "https://api.example.com/v1/",
+      "api_key": "YOUR_API_KEY",
+      "model_name": "your-model-name",
       "router": "openai-chat",
-      "stream": true
+      "stream": true,
+      "extra_args": {}
+    }
+  },
+  "default_agent": "build",
+  "agent_model_mapping": {
+    "build": "main",
+    "plan": "main",
+    "explore": "main",
+    "general": "main",
+    "compaction": "main"
+  }
+}
+```
+
+4. Start an interactive session:
+
+```bash
+gorcode
+```
+
+5. Or run one prompt and exit:
+
+```bash
+gorcode --prompt "Summarize this project"
+```
+
+Inside the session, type `/help` to see available commands.
+
+## Configuration
+
+GorCode reads configuration from:
+
+| Scope | Path |
+|---|---|
+| User | `~/.gorcode/config.json` |
+| Project | `./.gorcode/config.json` |
+| Custom | `gorcode --config path/to/config.json` |
+
+Project configuration can override or extend user configuration. Use `gorcode status` to inspect the merged result.
+
+### Model Routers
+
+Set `router` on each item in `model_connections`.
+
+| Router | Use case |
+|---|---|
+| `openai-chat` | OpenAI-compatible Chat Completions providers |
+| `anthropic` | Anthropic Messages API |
+| `openai-response` | OpenAI Responses API |
+| `openai-chat-interleaved` | OpenAI-compatible interleaved content |
+| `anthropic-interleaved` | Anthropic interleaved content |
+
+The connection name, such as `main`, is what you pass to `--model` and use in `agent_model_mapping`.
+
+## Daily Commands
+
+| Command | Purpose |
+|---|---|
+| `gorcode` | Start the default interactive session |
+| `gorcode --agent plan` | Start with a specific agent |
+| `gorcode --model main` | Start with a specific model connection |
+| `gorcode --prompt "..."` | Run one prompt and exit |
+| `gorcode status` | Show configuration and model mapping status |
+| `gorcode list-agents` | List available agents |
+| `gorcode --debug` | Start with debug mode enabled |
+| `gorcode --permission ask` | Ask before sensitive actions |
+| `gorcode --permission all` | Grant write, edit, and shell permissions for the session |
+| `gorcode --permission exceptrm` | Grant broad permissions except delete-style shell actions |
+| `gorcode --sandbox on` | Enable sandbox boundary checks for the session |
+
+Useful in-session commands:
+
+| Command | Purpose |
+|---|---|
+| `/agent <name>` | Switch agent |
+| `/model <name>` | Switch model connection |
+| `/mcps` | Manage MCP servers |
+| `/skills` | Manage skills |
+| `/compact [--soft\|--hard\|--status]` | Compact or inspect context |
+| `/context status` | Show context usage |
+| `/permission status` | Show session permissions |
+| `/sandbox status` | Show sandbox status |
+| `/debug on\|off\|status` | Manage debug mode |
+| `/new` | Start a new session |
+| `/history list [--all]` | List saved sessions for the current project, or all projects |
+| `/history load <id> [--all]` | Clone a saved session into a new active session |
+| `/history load path <file>` | Import a full session JSON file as a new session |
+| `/history save <file> [--force]` | Export the current session as full session JSON |
+| `/exit` | Exit GorCode |
+
+History commands are scoped to the current project by default. Use `--all` or
+`-a` to search, list, load, delete, info, or clear sessions across all projects.
+Loading history always creates a fresh session id; the original saved
+conversation remains unchanged.
+
+## Additional Features
+
+### Agents
+
+Agents define the role and behavior GorCode uses for a session or subtask.
+
+```bash
+gorcode list-agents
+gorcode --agent plan
+```
+
+Switch inside a session:
+
+```text
+/agent build
+/agent plan
+```
+
+Map agents to model connections in config:
+
+```json
+{
+  "default_agent": "build",
+  "agent_model_mapping": {
+    "build": "main",
+    "plan": "main",
+    "explore": "main",
+    "general": "main"
+  }
+}
+```
+
+### MCP Servers
+
+Add MCP servers under `mcp_servers`:
+
+```json
+{
+  "mcp_servers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/project"]
     }
   }
 }
 ```
 
-### 2. Start Coding
+Manage them inside a session:
+
+```text
+/mcps
+/mcps connect filesystem
+/mcps status
+/mcps disconnect filesystem
+```
+
+You can also run MCP commands before startup with `gorcode --mcps "connect filesystem"`.
+
+### Skills
+
+Skills inject reusable project or personal knowledge into conversations.
+
+Standard skill locations:
+
+```text
+~/.gorcode/skills/
+./.gorcode/skills/
+```
+
+Minimal skill file:
+
+```md
+---
+name: project-style
+description: Project conventions for code edits.
+---
+
+Follow the project's naming, testing, and error-handling conventions.
+```
+
+Manage skills inside a session:
+
+```text
+/skills
+/skills show project-style
+/skills enable project-style
+/skills disable project-style
+/skills reload
+```
+
+### Permissions And Sandbox
+
+Permission profiles control what the assistant may do during the current session:
+
+| Profile | Meaning |
+|---|---|
+| `ask` | Ask before sensitive write, edit, or shell operations |
+| `all` | Grant write, edit, shell, and delete-style shell permissions |
+| `exceptrm` | Grant broad permissions but keep delete-style shell actions restricted |
+
+Start with a profile:
 
 ```bash
-# Start GorCode with default agent
-gorcode
-
-# Use a specific agent
-gorcode --agent plan
-
-# Use a specific model
-gorcode --model claude
+gorcode --permission ask
+gorcode --permission exceptrm
 ```
 
-## Architecture
+Sandbox checks can be controlled at startup or during a session:
 
-```
-GorCode/
-├── GorAI_LLMClient/          # Unified LLM client library
-│   ├── models/               # Provider-specific implementations
-│   │   ├── _openai_model.py
-│   │   ├── _anthropic_model.py
-│   │   ├── _deepseek_openai_model.py
-│   │   └── ...
-│   └── executor.py           # Tool execution engine
-├── backend/
-│   ├── agents/               # Agent system
-│   │   ├── base.py          # Base agent classes
-│   │   └── loader.py        # Agent loading
-│   ├── core/
-│   │   ├── model_connector.py  # Multi-provider connector
-│   │   └── executor.py      # Core execution logic
-│   ├── mcp/                 # MCP protocol support
-│   ├── skills/              # Skill system
-│   └── tools/               # Built-in tools
-├── frontend/
-│   └── cli/                 # Command-line interface
-└── agents/                  # Built-in agent definitions
-    ├── build.md
-    ├── plan.md
-    ├── explore.md
-    └── general.md
+```bash
+gorcode --sandbox on
+gorcode --sandbox off
 ```
 
-## Creating Custom Agents
-
-Create a new agent by adding a `.md` file to `.gorcode/agents/`:
-
-```markdown
----
-name: security-audit
-mode: subagent
-description: Security-focused code review agent
-is_native: false
-allowsubagents: ["explore"]
-tools:
-  search_codebase: true
-  file_tools: true
-  webfetch: true
-permissions:
-  edit: ask
-  bash:
-    "*": deny
----
-
-# Security Audit Agent
-
-You are a security-focused code reviewer. Your task is to:
-1. Identify potential security vulnerabilities
-2. Check for common security anti-patterns
-3. Review authentication and authorization logic
-4. Analyze input validation
-
-Always provide specific line references and suggest fixes.
+```text
+/sandbox status
+/sandbox on
+/sandbox off
+/sandbox reload
 ```
 
-## MCP Configuration
+### Context Compression
 
-Add MCP servers to your config:
+GorCode can compress long conversations before model requests. The trigger is based on `max_context_length * compression_settings.trigger.threshold_ratio`.
+
+Built-in compression configuration:
 
 ```json
 {
-  "mcpServers": {
-    "filesystem": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed/dir"]
+  "max_context_length": 128000,
+  "compression_settings": {
+    "enabled": true,
+    "algorithm": "gorcode_builtin",
+    "trigger": {
+      "event": "before_model_request",
+      "threshold_ratio": 0.85
     },
-    "github": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": {
-        "GITHUB_PERSONAL_ACCESS_TOKEN": "your-token"
+    "algorithms": {
+      "gorcode_builtin": {
+        "type": "builtin",
+        "name": "gorcode_builtin",
+        "options": {
+          "soft_enabled": true,
+          "hard_enabled": true,
+          "hard_keep_turns": 1,
+          "protected_tools": ["skill", "Skill"]
+        }
       }
     }
   }
 }
 ```
 
-## Supported Routers
+Minimal custom Python compression registration:
 
-| Router | Description | Best For |
-|--------|-------------|----------|
-| `openai-chat` | OpenAI Chat Completion API | GPT-4, GPT-3.5, DeepSeek, MiniMax |
-| `anthropic` | Anthropic Messages API | Claude 3.5/3.7 Sonnet |
-| `openai-chat-interleaved` | OpenAI with interleaved content | Complex multimodal tasks |
-| `anthropic-interleaved` | Anthropic with interleaved content | Complex multimodal tasks |
-| `openai-response` | OpenAI Responses API | Latest OpenAI features |
+```json
+{
+  "compression_settings": {
+    "enabled": true,
+    "algorithm": "my_compressor",
+    "trigger": {
+      "event": "before_model_request",
+      "threshold_ratio": 0.85
+    },
+    "algorithms": {
+      "my_compressor": {
+        "type": "python",
+        "module_path": ".gorcode/compression/my_compressor.py",
+        "entrypoint": "compress",
+        "options": {}
+      }
+    }
+  }
+}
+```
 
-## Environment Variables
+The entrypoint function receives a compression request and returns a compression result. Keep failures explicit: invalid configuration or algorithm errors should surface during startup or compression.
 
-| Variable | Description |
-|----------|-------------|
-| `GORCODE_CONFIG` | Path to custom config file |
-| `GORCODE_WORKDIR` | Default working directory |
-| `GORCODE_DEBUG` | Enable debug logging |
+### Debug And Status
 
-## Contributing
+Use status output to inspect config paths, model connections, and agent mapping:
 
-We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+```bash
+gorcode status
+```
+
+Enable debug mode for one run:
+
+```bash
+gorcode --debug
+```
+
+Or set it in config:
+
+```json
+{
+  "debug_mode": true
+}
+```
+
+Inside a session:
+
+```text
+/debug status
+/debug on
+/debug off
+```
+
+## Project Organization
+
+GorCode keeps the CLI, backend runtime, agents, tools, MCP, skills, sandbox, compression, and model connectors separated. Most users only need to edit configuration under `~/.gorcode/` or project-level `.gorcode/`. Internal implementation details live in the source tree and development docs.
+
+## Troubleshooting
+
+- `gorcode` command not found: run the setup script from the `GorCode/` Python project directory, then open a new terminal.
+
+```powershell
+.\scripts\setup-gorcode.ps1
+```
+
+```bash
+bash scripts/setup-gorcode.sh
+```
+
+You can also run `python run_gorcode.py` from the project directory.
+
+- No usable model connection: check `~/.gorcode/config.json`. At least one item in `model_connections` needs a non-empty `api_key`, `base_url`, `model_name`, and `router`.
+
+- Agent cannot switch models: check that every value in `agent_model_mapping` points to an existing key in `model_connections`.
+
+- MCP server does not work: run the configured MCP command directly in your terminal first. If that fails, fix the command, args, or environment variables before reconnecting with `/mcps connect <name>`.
 
 ## License
 
 GorCode is released under the [MIT License](LICENSE).
 
-## Acknowledgments
-
-- Built with [GorAI_LLMClient](GorCode/GorAI_LLMClient/) for unified LLM access
-- Inspired by Claude Code and other AI coding assistants
-- MCP protocol support based on [Model Context Protocol](https://modelcontextprotocol.io/)
-
 ---
 
-**[中文文档](README_CN.md)** | **[Documentation](docs/)** | **[Issues](https://github.com/Kingge97/GorCode/issues)**
+[中文文档](README_CN_NEW.md)

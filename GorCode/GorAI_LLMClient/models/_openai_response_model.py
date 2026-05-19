@@ -2,6 +2,7 @@ import json
 from openai import OpenAI, APIConnectionError, APITimeoutError
 from ._model_base import model_base
 from ..message._message_base import MsgReturn
+from ..message._usage import make_usage_message, normalize_openai_response_usage
 
 
 class openai_response_model(model_base):
@@ -12,8 +13,17 @@ class openai_response_model(model_base):
     内部自动管理 previous_response_id 实现对话连续性。
     """
     
-    def __init__(self, base_url, api_key, model_name, stream=True, extra_args=None, router=None):
-        super().__init__(base_url, api_key, model_name, stream, extra_args, router)
+    def __init__(
+        self,
+        base_url,
+        api_key,
+        model_name,
+        stream=True,
+        extra_args=None,
+        router=None,
+        hooks=None,
+    ):
+        super().__init__(base_url, api_key, model_name, stream, extra_args, router, hooks)
         self.client = OpenAI(
             base_url=self.base_url,
             api_key=self.api_key
@@ -272,6 +282,7 @@ class openai_response_model(model_base):
         current_tool_index = None
         response_id = None
         saw_text_delta = False
+        usage = None
         
         # 用于调试：收集所有事件类型
         debug_event_types = set()
@@ -494,6 +505,8 @@ class openai_response_model(model_base):
             elif event_type == "response.completed":
                 if hasattr(event, 'response') and event.response:
                     response_id = event.response.id
+                    if hasattr(event.response, "usage") and event.response.usage:
+                        usage = normalize_openai_response_usage(event.response.usage)
             
             # 处理响应失败事件
             elif event_type == "response.failed":
@@ -521,6 +534,8 @@ class openai_response_model(model_base):
             elif event_type == "done" or event_type == "completed":
                 if hasattr(event, 'response') and event.response:
                     response_id = event.response.id
+                    if hasattr(event.response, "usage") and event.response.usage:
+                        usage = normalize_openai_response_usage(event.response.usage)
         
         # 调试输出
         if not content and not tool_calls_dict:
@@ -545,6 +560,9 @@ class openai_response_model(model_base):
                     default_response=None
                 )
         
+        if usage:
+            yield make_usage_message(usage, default_response=None)
+
         # 返回结束标志
         yield MsgReturn(
             content="",
@@ -636,6 +654,10 @@ class openai_response_model(model_base):
                                     default_response=response
                                 )
         
+        if hasattr(response, "usage") and response.usage:
+            usage = normalize_openai_response_usage(response.usage)
+            yield make_usage_message(usage, default_response=response)
+
         # 返回结束标志
         yield MsgReturn(
             content="",
@@ -686,8 +708,18 @@ class openai_response_model(model_base):
         # 初始化变量
         is_first_round = True
         tool_info = []
+        loop_round = 0
+        previous_round_had_tools = False
+        hook_metadata = {}
         
         try:
+            hook_metadata = self._run_lifecycle_hooks(
+                "before_loop_start",
+                messages,
+                loop_round=loop_round,
+                previous_round_had_tools=previous_round_had_tools,
+                metadata=hook_metadata,
+            )
             # 对话循环
             while is_first_round or tool_info:
                 is_first_round = False
@@ -701,6 +733,13 @@ class openai_response_model(model_base):
                 # print("=" * 20 + "思考过程" + "=" * 20)
                 
                 # 调用 model_chat
+                hook_metadata = self._run_lifecycle_hooks(
+                    "before_model_request",
+                    messages,
+                    loop_round=loop_round,
+                    previous_round_had_tools=previous_round_had_tools,
+                    metadata=hook_metadata,
+                )
                 response = self.model_chat(messages)
                 
                 # 处理响应
@@ -708,6 +747,14 @@ class openai_response_model(model_base):
                     # 检查中断标志
                     if interrupt_check():
                         # print(f"\n检测到中断请求，停止对话")
+                        self._run_lifecycle_hooks(
+                            "on_interrupt",
+                            messages,
+                            loop_round=loop_round,
+                            previous_round_had_tools=previous_round_had_tools,
+                            tool_info=tool_info,
+                            metadata=hook_metadata,
+                        )
                         yield b"data: " + encode_json({'type': 'interrupted', 'message': '对话已被用户中断'}) + b"\n\n"
                         return
                     
@@ -715,12 +762,28 @@ class openai_response_model(model_base):
                     if item.gorType == "error":
                         error_msg = item.content
                         print(f"\n模型调用错误: {error_msg}")
+                        self._run_lifecycle_hooks(
+                            "on_error",
+                            messages,
+                            loop_round=loop_round,
+                            previous_round_had_tools=previous_round_had_tools,
+                            tool_info=tool_info,
+                            metadata={**hook_metadata, "error": error_msg},
+                        )
                         yield b"data: " + encode_json({'type': 'error', 'message': error_msg}) + b"\n\n"
                         return
 
                     # 处理连接断开错误
                     elif item.gorType == "connection_error":
                         error_msg = item.content
+                        self._run_lifecycle_hooks(
+                            "on_error",
+                            messages,
+                            loop_round=loop_round,
+                            previous_round_had_tools=previous_round_had_tools,
+                            tool_info=tool_info,
+                            metadata={**hook_metadata, "error": error_msg},
+                        )
                         yield b"data: " + encode_json({
                             'type': 'connection_error',
                             'message': error_msg,
@@ -728,6 +791,9 @@ class openai_response_model(model_base):
                         }) + b"\n\n"
                         return
                     
+                    elif item.gorType == "usage":
+                        yield self._make_usage_sse(item, encode_json)
+
                     # 处理思考内容
                     elif item.gorType == "think":
                         reasoning_content += item.content
@@ -759,29 +825,70 @@ class openai_response_model(model_base):
                     elif item.gorType == "end":
                         # print("\n" + "=" * 30 + "本次结束" + "=" * 30)
                         pass
+
+                hook_metadata = self._run_lifecycle_hooks(
+                    "after_model_response",
+                    messages,
+                    loop_round=loop_round,
+                    previous_round_had_tools=previous_round_had_tools,
+                    tool_info=tool_info,
+                    metadata={
+                        **hook_metadata,
+                        "answer_content": answer_content,
+                        "reasoning_content": reasoning_content,
+                    },
+                )
                 
                 # 如果有工具调用，执行工具并继续循环
                 if tool_info:
                     # 检查中断标志
                     if interrupt_check():
                         # print(f"\n检测到中断请求，停止工具执行")
+                        self._run_lifecycle_hooks(
+                            "on_interrupt",
+                            messages,
+                            loop_round=loop_round,
+                            previous_round_had_tools=previous_round_had_tools,
+                            tool_info=tool_info,
+                            metadata=hook_metadata,
+                        )
                         yield b"data: " + encode_json({'type': 'interrupted', 'message': '对话已被用户中断'}) + b"\n\n"
                         return
                     
                     # 执行工具调用
-                    yield from self._execute_tools_in_loop(
+                    hook_metadata = yield from self._execute_tools_in_loop(
                         tool_info, messages, answer_content, reasoning_content,
-                        executor, encode_json, interrupt_check
+                        executor, encode_json, interrupt_check,
+                        loop_round=loop_round,
+                        previous_round_had_tools=previous_round_had_tools,
+                        metadata=hook_metadata,
                     )
+                    hook_metadata = self._run_lifecycle_hooks(
+                        "before_next_loop",
+                        messages,
+                        loop_round=loop_round,
+                        previous_round_had_tools=True,
+                        tool_info=tool_info,
+                        metadata=hook_metadata,
+                    )
+                    previous_round_had_tools = True
                 else:
                     # 没有工具调用，但有自然语言回答时，追加assistant消息到历史记录
                     if answer_content:
                         messages.append({'role': 'assistant', 'content': answer_content})
+                    previous_round_had_tools = False
+                loop_round += 1
             
             # 注意：当发生工具调用时，助手消息（包含tool_calls）已经在 _execute_tools_in_loop 中添加
             # 当没有工具调用时，助手消息已在上面添加
             # 所以这里不需要额外处理
-            
+            self._run_lifecycle_hooks(
+                "after_loop_end",
+                messages,
+                loop_round=loop_round,
+                previous_round_had_tools=previous_round_had_tools,
+                metadata=hook_metadata,
+            )
             yield b"data: " + encode_json({'type': 'end'}) + b"\n\n"
         
         except Exception as e:
@@ -791,8 +898,20 @@ class openai_response_model(model_base):
             print(traceback.format_exc())
             yield b"data: " + encode_json({'type': 'error', 'message': error_msg}) + b"\n\n"
     
-    def _execute_tools_in_loop(self, tool_info, messages, answer_content, reasoning_content,
-                               executor, encode_json, interrupt_check):
+    def _execute_tools_in_loop(
+        self,
+        tool_info,
+        messages,
+        answer_content,
+        reasoning_content,
+        executor,
+        encode_json,
+        interrupt_check,
+        *,
+        loop_round,
+        previous_round_had_tools,
+        metadata,
+    ):
         """
         执行工具调用并更新消息历史
         
@@ -853,9 +972,19 @@ class openai_response_model(model_base):
         # 执行工具调用
         # print("工具数量：" + str(len(tool_info)))
         for tool in tool_info:
+            tool_name = tool.get("name", "unknown")
+            tool_call_id = tool.get("id", "")
             # 检查中断标志
             if interrupt_check():
                 print(f"\n检测到中断请求，停止工具执行")
+                self._run_lifecycle_hooks(
+                    "on_interrupt",
+                    messages,
+                    loop_round=loop_round,
+                    previous_round_had_tools=previous_round_had_tools,
+                    tool_info=[tool],
+                    metadata=metadata,
+                )
                 yield b"data: " + encode_json({'type': 'interrupted', 'message': '对话已被用户中断'}) + b"\n\n"
                 return
             
@@ -879,6 +1008,14 @@ class openai_response_model(model_base):
                         "call_id": tool.get('id', ''),
                         "output": error_msg
                     })
+                    metadata = self._run_lifecycle_hooks(
+                        "after_tool_execution",
+                        messages,
+                        loop_round=loop_round,
+                        previous_round_had_tools=previous_round_had_tools,
+                        tool_info=[tool],
+                        metadata={**metadata, "tool_error": error_msg},
+                    )
                     continue
                 
                 tool_name = tool["name"]
@@ -894,6 +1031,14 @@ class openai_response_model(model_base):
                     'args': tool_args
                 }) + b"\n\n"
                 
+                metadata = self._run_lifecycle_hooks(
+                    "before_tool_execution",
+                    messages,
+                    loop_round=loop_round,
+                    previous_round_had_tools=previous_round_had_tools,
+                    tool_info=[{**tool, "parsed_arguments": tool_args}],
+                    metadata=metadata,
+                )
                 # 执行工具
                 result = executor.execute_tool(tool_name, tool_args)
                 
@@ -922,6 +1067,14 @@ class openai_response_model(model_base):
                     "call_id": tool_call_id,
                     "output": tool_result_content
                 })
+                metadata = self._run_lifecycle_hooks(
+                    "after_tool_execution",
+                    messages,
+                    loop_round=loop_round,
+                    previous_round_had_tools=previous_round_had_tools,
+                    tool_info=[{**tool, "parsed_arguments": tool_args}],
+                    metadata={**metadata, "tool_result": result},
+                )
             
             except Exception as e:
                 error_msg = f"工具执行错误: {str(e)}"
@@ -937,3 +1090,12 @@ class openai_response_model(model_base):
                     "call_id": tool_call_id,
                     "output": error_msg
                 })
+                metadata = self._run_lifecycle_hooks(
+                    "after_tool_execution",
+                    messages,
+                    loop_round=loop_round,
+                    previous_round_had_tools=previous_round_had_tools,
+                    tool_info=[tool],
+                    metadata={**metadata, "tool_error": error_msg},
+                )
+        return metadata

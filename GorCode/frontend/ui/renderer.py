@@ -905,17 +905,18 @@ class UIRenderer:
         
         return choice
 
-    def confirm_history_clear(self, count: int) -> bool:
+    def confirm_history_clear(self, count: int, scope: str = "all projects") -> bool:
         """
         Confirm clearing all history sessions.
         
         Args:
             count: Number of sessions to delete
+            scope: Human-readable history scope
         
         Returns:
             True if user confirms, False otherwise.
         """
-        self.console.print(f"[yellow]This will delete {count} session(s).[/yellow]")
+        self.console.print(f"[yellow]This will delete {count} session(s) in {scope}.[/yellow]")
         try:
             choice = Prompt.ask(
                 "Type 'yes' to confirm",

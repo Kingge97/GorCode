@@ -6,14 +6,13 @@ Handles session persistence to disk.
 """
 
 import json
-import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import threading
-import shutil
 
-from .models import Session, SessionMetadata, SessionSearchResult
+from .models import Session, SessionSearchResult
+from .scope import SCOPE_ALL, SCOPE_PROJECT, normalize_scope, paths_match
 
 
 class SessionStorage:
@@ -31,6 +30,13 @@ class SessionStorage:
     SESSIONS_DIR = "sessions"
     INDEX_FILE = "index.json"
     SESSION_EXTENSION = ".json"
+    SOURCE_FIELDS = (
+        "source_session_id",
+        "source_path",
+        "source_kind",
+        "source_agent",
+        "source_model",
+    )
     
     def __init__(self, base_path: str = None):
         """
@@ -97,14 +103,23 @@ class SessionStorage:
         """
         with self._lock:
             index = self._load_index()
-            index[session.session_id] = {
-                "title": session.title or session.generate_title(),
-                "created_at": session.metadata.created_at.isoformat(),
-                "updated_at": session.metadata.updated_at.isoformat(),
-                "message_count": session.metadata.message_count,
-                "agent": session.metadata.agent,
-            }
+            index[session.session_id] = self._index_entry(session)
             self._save_index(index)
+
+    def _index_entry(self, session: Session) -> Dict[str, Any]:
+        """Build a compact index entry from full session metadata."""
+        metadata = session.metadata
+        entry = {
+            "title": session.title or session.generate_title(),
+            "created_at": metadata.created_at.isoformat(),
+            "updated_at": metadata.updated_at.isoformat(),
+            "message_count": metadata.message_count,
+            "agent": metadata.agent,
+            "project_path": metadata.project_path,
+        }
+        for field_name in self.SOURCE_FIELDS:
+            entry[field_name] = getattr(metadata, field_name, "")
+        return entry
     
     def _remove_index_entry(self, session_id: str) -> None:
         """
@@ -213,6 +228,8 @@ class SessionStorage:
         offset: int = 0,
         sort_by: str = "updated_at",
         ascending: bool = False,
+        scope: str = SCOPE_PROJECT,
+        project_path: str = "",
     ) -> List[SessionSearchResult]:
         """
         List sessions with pagination.
@@ -222,6 +239,8 @@ class SessionStorage:
             offset: Offset for pagination
             sort_by: Field to sort by (updated_at, created_at, title)
             ascending: Sort ascending if True
+            scope: project for current-project history, all for global history
+            project_path: Current project path for project scope
             
         Returns:
             List of session search results
@@ -231,14 +250,8 @@ class SessionStorage:
         # Convert to list and sort
         sessions = []
         for session_id, meta in index.items():
-            sessions.append(SessionSearchResult(
-                session_id=session_id,
-                title=meta.get("title", ""),
-                created_at=datetime.fromisoformat(meta["created_at"]),
-                updated_at=datetime.fromisoformat(meta["updated_at"]),
-                message_count=meta.get("message_count", 0),
-                agent=meta.get("agent", "build"),
-            ))
+            if self._meta_in_scope(meta, scope, project_path):
+                sessions.append(self._search_result_from_meta(session_id, meta))
         
         # Sort
         reverse = not ascending
@@ -256,6 +269,8 @@ class SessionStorage:
         self,
         query: str,
         limit: int = 10,
+        scope: str = SCOPE_PROJECT,
+        project_path: str = "",
     ) -> List[SessionSearchResult]:
         """
         Search sessions by title or content.
@@ -263,6 +278,8 @@ class SessionStorage:
         Args:
             query: Search query
             limit: Maximum results to return
+            scope: project for current-project history, all for global history
+            project_path: Current project path for project scope
             
         Returns:
             List of matching sessions
@@ -273,18 +290,13 @@ class SessionStorage:
         index = self._load_index()
         
         for session_id, meta in index.items():
+            if not self._meta_in_scope(meta, scope, project_path):
+                continue
             title = meta.get("title", "").lower()
             
             # Search in title
             if query in title:
-                results.append(SessionSearchResult(
-                    session_id=session_id,
-                    title=meta.get("title", ""),
-                    created_at=datetime.fromisoformat(meta["created_at"]),
-                    updated_at=datetime.fromisoformat(meta["updated_at"]),
-                    message_count=meta.get("message_count", 0),
-                    agent=meta.get("agent", "build"),
-                ))
+                results.append(self._search_result_from_meta(session_id, meta))
                 continue
             
             # Search in content (load full session)
@@ -295,39 +307,101 @@ class SessionStorage:
                     if isinstance(content, str) and query in content.lower():
                         # Create result with preview
                         preview = content[:100] + "..." if len(content) > 100 else content
-                        results.append(SessionSearchResult(
-                            session_id=session_id,
-                            title=meta.get("title", ""),
-                            created_at=datetime.fromisoformat(meta["created_at"]),
-                            updated_at=datetime.fromisoformat(meta["updated_at"]),
-                            message_count=meta.get("message_count", 0),
-                            agent=meta.get("agent", "build"),
-                            preview=preview,
-                        ))
+                        result = self._search_result_from_meta(session_id, meta)
+                        result.preview = preview
+                        results.append(result)
                         break
             
             if len(results) >= limit:
                 break
         
         return results[:limit]
+
+    def _meta_in_scope(self, meta: Dict[str, Any], scope: str, project_path: str) -> bool:
+        """Return whether an index entry belongs to the requested history scope."""
+        if normalize_scope(scope) == SCOPE_ALL:
+            return True
+        return paths_match(str(meta.get("project_path", "")), project_path)
+
+    def _session_in_scope(self, session: Session, scope: str, project_path: str) -> bool:
+        """Return whether a full session belongs to the requested history scope."""
+        if normalize_scope(scope) == SCOPE_ALL:
+            return True
+        return paths_match(session.metadata.project_path, project_path)
+
+    def _search_result_from_meta(
+        self,
+        session_id: str,
+        meta: Dict[str, Any],
+    ) -> SessionSearchResult:
+        """Create a search result from an index entry."""
+        return SessionSearchResult(
+            session_id=session_id,
+            title=meta.get("title", ""),
+            created_at=datetime.fromisoformat(meta["created_at"]),
+            updated_at=datetime.fromisoformat(meta["updated_at"]),
+            message_count=meta.get("message_count", 0),
+            agent=meta.get("agent", "build"),
+            project_path=meta.get("project_path", ""),
+            source_session_id=meta.get("source_session_id", ""),
+            source_path=meta.get("source_path", ""),
+            source_kind=meta.get("source_kind", ""),
+            source_agent=meta.get("source_agent", ""),
+            source_model=meta.get("source_model", ""),
+        )
+
+    def load_scoped(
+        self,
+        session_id: str,
+        scope: str = SCOPE_PROJECT,
+        project_path: str = "",
+    ) -> Optional[Session]:
+        """Load a session only if it belongs to the requested scope."""
+        session = self.load(session_id)
+        if not session:
+            return None
+        if self._session_in_scope(session, scope, project_path):
+            return session
+        return None
+
+    def exists_outside_project(self, session_id: str, project_path: str) -> bool:
+        """Return true when a matching session exists outside current project."""
+        session = self.load(session_id)
+        if not session:
+            return False
+        return not paths_match(session.metadata.project_path, project_path)
     
-    def count(self) -> int:
+    def count(self, scope: str = SCOPE_ALL, project_path: str = "") -> int:
         """
         Get total session count.
         
         Returns:
             Number of sessions
         """
-        return len(self._load_index())
+        index = self._load_index()
+        return sum(
+            1
+            for meta in index.values()
+            if self._meta_in_scope(meta, scope, project_path)
+        )
 
-    def list_session_ids(self) -> List[str]:
+    def list_session_ids(
+        self,
+        scope: str = SCOPE_ALL,
+        project_path: str = "",
+    ) -> List[str]:
         """
         List all session IDs from the index.
         
         Returns:
             List of session IDs
         """
-        return list(self._load_index().keys())
+        index = self._load_index()
+        return [
+            session_id
+            for session_id, meta in index.items()
+            if self._meta_in_scope(meta, scope, project_path)
+        ]
     
     # ========================
     # Maintenance
@@ -352,13 +426,7 @@ class SessionStorage:
                     data = json.load(f)
                 
                 session = Session.from_dict(data)
-                index[session.session_id] = {
-                    "title": session.title or session.generate_title(),
-                    "created_at": session.metadata.created_at.isoformat(),
-                    "updated_at": session.metadata.updated_at.isoformat(),
-                    "message_count": session.metadata.message_count,
-                    "agent": session.metadata.agent,
-                }
+                index[session.session_id] = self._index_entry(session)
                 count += 1
             except (json.JSONDecodeError, IOError, KeyError) as e:
                 print(f"Error indexing {session_file}: {e}")
