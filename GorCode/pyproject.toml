@@ -1,6 +1,6 @@
 [project]
 name = "gorcode"
-version = "2.5.0"
+version = "2.5.2"
 description = "AI-Powered CLI Coding Assistant"
 authors = [{name = "GorAI"}]
 readme = "README.md"

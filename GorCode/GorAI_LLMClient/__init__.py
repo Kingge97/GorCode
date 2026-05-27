@@ -4,7 +4,7 @@ GorAI LLM Client
 
 A unified LLM client supporting multiple providers (OpenAI, Anthropic, etc.)
 
-Version: 0.4.0
+Version: 0.4.1
 
 Example usage:
     >>> from GorAI_LLMCLient import create_model
@@ -25,14 +25,15 @@ Example usage:
     ...     print(event)
 """
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 # Re-export the main functions from models
 from .models import (
-    create_model, model_base, 
+    create_model, model_base,
     openai_chat_completetion_model, anthropic_model,
     openai_response_model,
-    openai_chat_interleaved_model, anthropic_interleaved_model,
+    openai_chat_interleaved_model, openai_chat_interleaved_qwen35pmodel,
+    anthropic_interleaved_model,
 )
 from .hooks import HookEvent, HookRegistration, HookResult
 
@@ -46,6 +47,7 @@ __all__ = [
     "anthropic_model",
     "openai_response_model",
     "openai_chat_interleaved_model",
+    "openai_chat_interleaved_qwen35pmodel",
     "anthropic_interleaved_model",
     "HookEvent",
     "HookRegistration",

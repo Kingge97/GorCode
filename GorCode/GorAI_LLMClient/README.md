@@ -4,7 +4,7 @@ A unified LLM client library supporting multiple providers (OpenAI, Anthropic, e
 
 ## Version
 
-**Current Version: 0.4.0**
+**Current Version: 0.4.1**
 
 ## Features
 

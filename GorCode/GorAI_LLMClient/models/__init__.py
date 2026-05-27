@@ -3,6 +3,7 @@ from ._openai_model import openai_chat_completetion_model
 from ._anthropic_model import anthropic_model
 from ._openai_response_model import openai_response_model
 from ._openai_chat_interleaved_model import openai_chat_interleaved_model
+from ._openai_chat_interleaved_qwen35pmodel import openai_chat_interleaved_qwen35pmodel
 from ._anthropic_interleaved_model import anthropic_interleaved_model
 
 __all__ = [
@@ -11,6 +12,7 @@ __all__ = [
     "anthropic_model",
     "openai_response_model",
     "openai_chat_interleaved_model",
+    "openai_chat_interleaved_qwen35pmodel",
     "anthropic_interleaved_model",
     "create_model"
 ]
@@ -61,6 +63,16 @@ def create_model(
         )
     elif router == "openai-chat-interleaved":
         return openai_chat_interleaved_model(
+            base_url=base_url,
+            api_key=api_key,
+            model_name=model_name,
+            stream=stream,
+            extra_args=extra_args,
+            router=router,
+            hooks=hooks,
+        )
+    elif router == "openai-chat-interleaved-qwen35p":
+        return openai_chat_interleaved_qwen35pmodel(
             base_url=base_url,
             api_key=api_key,
             model_name=model_name,

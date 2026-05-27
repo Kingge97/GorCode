@@ -201,13 +201,17 @@ When to use:
 
     def get_parameters(self) -> Dict[str, Any]:
         """Get tool parameter schema with dynamic skill options."""
+        available_skills = list(self._get_available_skills().keys()) if self._skill_loader else []
+        skill_schema = {
+            "type": "string",
+            "description": "Name of the skill to load",
+        }
+        if available_skills:
+            skill_schema["enum"] = available_skills
+
         return build_parameters_schema(
             properties={
-                "skill": {
-                    "type": "string",
-                    "description": "Name of the skill to load",
-                    "enum": list(self._get_available_skills().keys()) if self._skill_loader else []
-                }
+                "skill": skill_schema
             },
             required=["skill"],
         )
