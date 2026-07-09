@@ -16,14 +16,8 @@ from .contracts import (
     CompressionResult,
     CompressionRunResult,
 )
-from .controller import CompressionController
+from .controller import CompressionController, validate_system_message_position
 from .loader import CompressionAlgorithmLoader, LoadedCompressionAlgorithm
-from .system_prompt import (
-    SYSTEM_MESSAGE_PLACEHOLDER,
-    hide_system_message,
-    restore_system_message,
-    validate_system_message_position,
-)
 from .token_counter import default_count_tokens
 
 __all__ = [
@@ -40,11 +34,8 @@ __all__ = [
     "CompressionSettings",
     "CompressionTriggerConfig",
     "LoadedCompressionAlgorithm",
-    "SYSTEM_MESSAGE_PLACEHOLDER",
     "default_compression_settings_dict",
     "default_count_tokens",
-    "hide_system_message",
     "parse_compression_settings",
-    "restore_system_message",
     "validate_system_message_position",
 ]

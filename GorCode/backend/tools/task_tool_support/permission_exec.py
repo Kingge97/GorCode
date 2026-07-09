@@ -5,6 +5,7 @@ Shared permission execution helpers for tools.
 from typing import Any, Dict, Optional, Tuple
 
 from ...permission import PermissionManager, PermissionType
+from ...permission.contracts import PermissionRequester
 from ...permission.utils import get_permission_type, request_permission_sync
 from ...sandbox import decision_to_tool_result, protocol_error_result
 from ...sandbox.types import SandboxProtocolError
@@ -54,10 +55,11 @@ def execute_with_permissions(
     tool: Any,
     result: ToolResult,
     permission_manager: Optional[PermissionManager],
-    permission_callback,
+    permission_requester: Optional[PermissionRequester],
     *,
     sandbox_manager=None,
     arguments: Optional[Dict[str, Any]] = None,
+    request_context: Optional[Dict[str, Any]] = None,
 ) -> Tuple[ToolResult, bool]:
     """
     Execute a tool after handling permission checks.
@@ -83,10 +85,11 @@ def execute_with_permissions(
 
     granted, error_msg, rejected_without_reason = request_permission_sync(
         permission_manager,
-        permission_callback,
+        permission_requester,
         permission_type,
         result.metadata,
         tool_name=tool_name,
+        request_context=request_context,
     )
     if not granted:
         return ToolResult(success=False, output="", error=error_msg), rejected_without_reason

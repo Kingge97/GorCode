@@ -3,7 +3,7 @@ name: explore
 description: Fast agent specialized for exploring codebases. Use for finding files, searching code, or answering questions about the codebase.
 mode: subagent
 hidden: true
-tools: read, glob, grep, search_codebase, ls
+tools: read, glob, grep, ls
 allowsubagents: denyall
 permissions:
   edit: deny

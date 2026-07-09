@@ -18,8 +18,11 @@ from .model_connector import ModelConnector, ModelManager
 from ..config.manager import ConfigManager, ModelConnection
 from ..tools.core_tool_support.base import ToolRegistry, ToolResult
 from ..agents.base import AgentRegistry, AgentInfo
+from ..agents.capability_catalog import build_agent_access_policy
+from ..agents.capability_prompt import format_capability_sections
 from ..session import SessionManager, SessionStorage, DebugLogger
-from ..permission import get_permission_manager, PermissionType, PermissionResponse
+from ..permission import PermissionManager, PermissionType
+from ..permission.contracts import PermissionRequester
 from ..sandbox import SandboxManager, protocol_error_result
 from ..tools.task_tool_support.permission_exec import execute_with_permissions
 from ..hooks import HookRuntime, make_call_base
@@ -72,9 +75,9 @@ class GorCodeToolExecutor(ToolExecutor):
     """
     
     def __init__(self, tool_registry: ToolRegistry, event_bus: EventBus = None,
-                 permission_manager=None, permission_callback=None, backend_state=None,
+                 permission_manager=None, permission_requester=None, backend_state=None,
                  sandbox_manager=None, hook_runtime: Optional[HookRuntime] = None,
-                 hook_base=None):
+                 hook_base=None, agent_name: Optional[str] = None, access_policy=None):
         """
         Initialize the executor.
         
@@ -82,19 +85,25 @@ class GorCodeToolExecutor(ToolExecutor):
             tool_registry: GorCode's tool registry
             event_bus: Event bus for emitting tool execution events
             permission_manager: Permission manager for session permissions
-            permission_callback: Callback for permission UI
+            permission_requester: Protocol requester for permission UI
             backend_state: Backend state for setting flags
             sandbox_manager: Sandbox manager for tool boundary checks
         """
         self.tool_registry = tool_registry
         self.event_bus = event_bus
         self._permission_manager = permission_manager
-        self._permission_callback = permission_callback
+        self._permission_requester = permission_requester
         self._backend_state = backend_state
         self._sandbox_manager = sandbox_manager
         self._hook_runtime = hook_runtime
         self._hook_base = hook_base
+        self._agent_name = agent_name
+        self._access_policy = access_policy
         self._user_rejected_without_reason = False  # Flag for rejection without reason
+        self._current_tool_context: Dict[str, Any] = {}
+
+    def set_current_tool_context(self, context: Optional[Dict[str, Any]]) -> None:
+        self._current_tool_context = dict(context or {})
     
     def execute_tool(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         """
@@ -123,7 +132,12 @@ class GorCodeToolExecutor(ToolExecutor):
                 tool_name, arguments, pre_result, handled_by_sandbox=True
             )
 
-        result = self.tool_registry.execute(tool_name, **arguments)
+        result = self.tool_registry.execute(
+            tool_name,
+            agent_name=self._agent_name,
+            access_policy=self._access_policy,
+            **arguments,
+        )
         return self._complete_host_tool(tool_name, arguments, result)
 
     def _complete_host_tool(
@@ -145,9 +159,10 @@ class GorCodeToolExecutor(ToolExecutor):
             tool,
             result,
             self._permission_manager,
-            self._permission_callback,
+            self._permission_requester,
             sandbox_manager=self._sandbox_manager,
             arguments=arguments,
+            request_context=self._permission_request_context(),
         )
         if rejected_without_reason:
             self._user_rejected_without_reason = True
@@ -240,6 +255,18 @@ class GorCodeToolExecutor(ToolExecutor):
                 self._hook_base.model_name,
             )
 
+    def _set_model_tool_context(
+        self,
+        tool_call_id: str,
+        tool_name: str,
+        args: Dict[str, Any],
+    ) -> None:
+        self.set_current_tool_context({
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "arguments": dict(args or {}),
+        })
+
     def _evaluate_pre_execution(self, tool_name: str, arguments: Dict[str, Any]) -> Optional[ToolResult]:
         if not self._sandbox_manager:
             return None
@@ -247,6 +274,14 @@ class GorCodeToolExecutor(ToolExecutor):
             return self._sandbox_manager.evaluate_pre_execution(tool_name, arguments)
         except Exception as exc:
             return protocol_error_result(exc)
+
+    def _permission_request_context(self) -> Dict[str, Any]:
+        context = dict(self._current_tool_context)
+        if self._hook_base:
+            context.setdefault("session_id", self._hook_base.session_id)
+            context.setdefault("agent_run_id", self._hook_base.agent_run_id)
+        context.setdefault("agent_name", self._agent_name)
+        return context
 
 
 def _format_tool_result(result: ToolResult) -> str:
@@ -296,13 +331,19 @@ class BackendExecutor:
     - Response caching
     """
     
-    def __init__(self, event_bus: EventBus = None, platform_detector: PlatformDetector = None):
+    def __init__(
+        self,
+        event_bus: EventBus = None,
+        platform_detector: PlatformDetector = None,
+        permission_manager: Optional[PermissionManager] = None,
+    ):
         self.event_bus = event_bus or EventBus()
         self.state = BackendState()
         self._model_manager: ModelManager = None
         self._config_manager: ConfigManager = None
         self._tool_registry: ToolRegistry = None
         self._agent_registry: AgentRegistry = None
+        self._access_policy = None
         self._session_manager: SessionManager = None
         self._debug_logger: DebugLogger = None
         self._compression_controller: Optional[CompressionController] = None
@@ -315,8 +356,8 @@ class BackendExecutor:
         self._hook_runtime: Optional[HookRuntime] = None
         
         # Permission management
-        self._permission_manager = get_permission_manager()
-        self._permission_callback = None  # Set by frontend
+        self._permission_manager = permission_manager or PermissionManager()
+        self._permission_requester: Optional[PermissionRequester] = None
         self._reconnect_callback = None  # Set by frontend
         self._reconnect_wait_seconds = 5
         self._pending_reconnect_success = False
@@ -351,21 +392,20 @@ class BackendExecutor:
             self._init_debug_logger()
             self._init_context_management()
             self._init_skill_system()
+            self._refresh_access_policy(validate=True)
+        else:
+            self._refresh_access_policy(validate=False)
     
     def set_permission_callback(self, callback):
-        """
-        Set permission callback for UI interaction.
-        
-        Args:
-            callback: Async function(request_id, permission_type, metadata) -> PermissionResponse
-        """
-        self._permission_callback = callback
-        self._permission_manager.set_permission_callback(callback)
-        # Sync permission callback to TaskTool for subagent execution
+        raise RuntimeError("permission_callback is obsolete; use set_permission_requester")
+
+    def set_permission_requester(self, requester: PermissionRequester) -> None:
+        """Set protocol requester used by tool permission checks."""
+        self._permission_requester = requester
         if self._tool_registry:
             task_tool = self._tool_registry.get("Task")
-            if task_tool and hasattr(task_tool, 'set_permission_callback'):
-                task_tool.set_permission_callback(callback)
+            if task_tool and hasattr(task_tool, 'set_permission_requester'):
+                task_tool.set_permission_requester(requester)
             if task_tool and hasattr(task_tool, 'set_permission_manager'):
                 task_tool.set_permission_manager(self._permission_manager)
             if task_tool and hasattr(task_tool, 'set_sandbox_manager'):
@@ -447,23 +487,8 @@ class BackendExecutor:
         """Extract connection error message if this event represents a connection issue."""
         event_type = event.get("type", "")
         msg = event.get("message") or event.get("content") or event.get("error") or ""
-        msg_lower = msg.lower() if isinstance(msg, str) else ""
         
         if event_type == "connection_error":
-            return msg or "connection_error"
-        
-        keywords = [
-            "connection_error",
-            "connection error",
-            "connectionerror",
-            "econn",
-            "connection reset",
-            "timed out",
-            "timeout",
-            "network error",
-            "network_error",
-        ]
-        if any(k in msg_lower for k in keywords):
             return msg or "connection_error"
         
         return None
@@ -518,49 +543,6 @@ class BackendExecutor:
             # Reconnect failed, increment failure count
             self._reconnect_failure_count += 1
     
-    async def _check_permission(
-        self,
-        tool_name: str,
-        permission_type: PermissionType,
-        metadata: Dict[str, Any],
-    ) -> PermissionResponse:
-        """
-        Check if permission is granted for an operation.
-        
-        Args:
-            permission_type: Type of permission needed
-            metadata: Permission metadata
-            
-        Returns:
-            PermissionResponse from user
-        """
-        decision = self._permission_manager.decide(tool_name, permission_type, metadata)
-        if decision.decision == "allow":
-            return PermissionResponse.ONCE
-        if decision.decision == "deny":
-            return PermissionResponse.REJECT
-
-        # Emit permission request event
-        self.emit(EventType.PERMISSION_REQUEST, {
-            "permission_type": permission_type.value,
-            "metadata": metadata,
-        })
-
-        # Request permission from user
-        response = await self._permission_manager.request_permission(
-            tool_name,
-            permission_type,
-            metadata,
-        )
-        
-        # Emit permission response event
-        self.emit(EventType.PERMISSION_RESPONSE, {
-            "permission_type": permission_type.value,
-            "response": response.value,
-        })
-        
-        return response
-    
     def _init_context_management(self) -> None:
         """Initialize context management (compaction, cache, streaming)."""
         self._init_compression_controller()
@@ -576,6 +558,7 @@ class BackendExecutor:
         config = self._config_manager.config
         settings = parse_compression_settings(config.compression_settings)
         loader = CompressionAlgorithmLoader(
+            config_manager=self._config_manager,
             event_bus=self.event_bus,
             model_manager=self._model_manager,
             project_path=self._config_manager.project_path,
@@ -671,11 +654,11 @@ class BackendExecutor:
                 # 设置 agent 和 tool registry
                 task_tool.set_agent_registry(self._agent_registry)
                 task_tool.set_tool_registry(self._tool_registry)
-                # 设置权限管理与回调（如果已有）
+                # 设置权限管理与协议 requester（如果已有）
                 if hasattr(task_tool, 'set_permission_manager'):
                     task_tool.set_permission_manager(self._permission_manager)
-                if hasattr(task_tool, 'set_permission_callback'):
-                    task_tool.set_permission_callback(self._permission_callback)
+                if hasattr(task_tool, 'set_permission_requester'):
+                    task_tool.set_permission_requester(self._permission_requester)
                 if hasattr(task_tool, 'set_sandbox_manager'):
                     task_tool.set_sandbox_manager(self._sandbox_manager)
                 if hasattr(task_tool, 'set_hook_runtime'):
@@ -686,6 +669,8 @@ class BackendExecutor:
                         self._get_session_id(),
                         self.state.current_model,
                     )
+                if hasattr(task_tool, 'set_access_policy'):
+                    task_tool.set_access_policy(self._access_policy)
                 
                 # 设置 config_manager，让 TaskTool 根据 agent_model_mapping 动态选择模型
                 if hasattr(task_tool, 'set_config_manager') and self._config_manager:
@@ -724,6 +709,26 @@ class BackendExecutor:
         skills = self._skill_loader.get_all_skills()
         if skills:
             print(f"[Executor] Loaded {len(skills)} skill(s): {', '.join(skills.keys())}")
+
+    def _refresh_access_policy(self, *, validate: bool) -> None:
+        """Build the immutable static capability policy snapshot."""
+        self._access_policy = build_agent_access_policy(
+            tool_registry=self._tool_registry,
+            skill_loader=self._skill_loader,
+            agent_registry=self._agent_registry,
+        )
+        if validate:
+            errors = self._access_policy.validate_all_agents()
+            if errors:
+                raise ValueError("Agent capability configuration error(s):\n" + "\n".join(errors))
+        self._sync_capability_policy_to_tools()
+
+    def _sync_capability_policy_to_tools(self) -> None:
+        if not self._tool_registry:
+            return
+        task_tool = self._tool_registry.get("Task")
+        if task_tool and hasattr(task_tool, "set_access_policy"):
+            task_tool.set_access_policy(self._access_policy)
     
     @property
     def model(self) -> Optional[ModelConnector]:
@@ -845,10 +850,7 @@ class BackendExecutor:
             "context_limit": context_limit,
             "usage_percentage": self._usage_percentage(self.state.token_count),
             "should_compact": self.state.token_count >= trigger_tokens,
-            "should_soft_compact": self.state.token_count >= trigger_tokens,
-            "should_hard_compact": self.state.token_count >= trigger_tokens,
-            "soft_threshold": trigger_tokens,
-            "hard_threshold": trigger_tokens,
+            "compact_threshold": trigger_tokens,
             "compression": self._compression_status(),
         }
         self._add_session_usage_to_payload(usage)
@@ -918,13 +920,12 @@ class BackendExecutor:
         """
         return self.check_context_overflow()
     
-    def compact_context(self, force: bool = False, force_soft: bool = False) -> Dict[str, Any]:
+    def compact_context(self, force: bool = False) -> Dict[str, Any]:
         """
-        Compact the conversation context using two-phase strategy.
+        Compact the conversation context.
         
         Args:
-            force: Force hard compaction even if not needed
-            force_soft: Force soft compaction even if not needed
+            force: Force compaction even if not needed
             
         Returns:
             Compaction result
@@ -934,13 +935,13 @@ class BackendExecutor:
         if not self._compression_controller.settings.enabled:
             return {"success": False, "error": "Compression is disabled"}
         try:
-            result = self._run_manual_compression(force, force_soft)
+            result = self._run_manual_compression(force)
         except CompressionError as exc:
             return {"success": False, "error": str(exc)}
         self._apply_manual_compression_result(result)
         return self._manual_compression_payload(result)
 
-    def _run_manual_compression(self, force: bool, force_soft: bool):
+    def _run_manual_compression(self, force: bool):
         messages = [
             {"role": "system", "content": self.get_system_prompt()},
             *self.state.messages,
@@ -949,7 +950,7 @@ class BackendExecutor:
             messages,
             force=True,
             source="manual",
-            metadata={"force": force, "force_soft": force_soft},
+            metadata={"force": force},
         )
 
     def _apply_manual_compression_result(self, result) -> None:
@@ -987,10 +988,8 @@ class BackendExecutor:
             "trigger_tokens": result.trigger_tokens,
             "compression_ratio": result.compression_ratio,
             "metadata": metadata,
-            "pruned_tool_results": metadata.get("pruned_tool_results", 0),
-            "cleared_tool_results": metadata.get("cleared_tool_results", 0),
-            "compaction_type": metadata.get("compaction_type", "none"),
-            "protected_tool_calls": metadata.get("protected_tool_calls", []),
+            "protected_tool_count": metadata.get("protected_tool_count", 0),
+            "user_message_count": metadata.get("user_message_count", 0),
             "summary": metadata.get("summary"),
             "error": None,
         }
@@ -1091,23 +1090,9 @@ class BackendExecutor:
         if agent and agent.prompt:
             prompt = agent.prompt.format(workdir=self._get_workdir())
             
-            # Auto-inject subagent descriptions based on allowsubagents config
-            if self._agent_registry:
-                subagents = self._agent_registry.get_available_subagents(agent.name)
-                if subagents:
-                    subagent_section = self._agent_registry.format_subagent_descriptions(subagents)
-                    prompt = prompt + "\n\n" + subagent_section
-            
-            # Auto-inject skill descriptions (metadata layer only)
-            if self._skill_loader:
-                enabled_skills = self._skill_loader.get_enabled_skills()
-                if enabled_skills:
-                    skill_lines = ["**Skills available** (invoke with Skill tool when task matches):"]
-                    for skill in enabled_skills:
-                        desc = skill.description or "No description"
-                        skill_lines.append(f"- {skill.name}: {desc}")
-                    skill_section = "\n".join(skill_lines)
-                    prompt = prompt + "\n\n" + skill_section
+            capability_section = format_capability_sections(self._access_policy, agent.name)
+            if capability_section:
+                prompt = prompt + "\n\n" + capability_section
             
             # Load custom prompt files (GORCODE.md, AGENTS.md, CLAUDE.md)
             from ..context import load_custom_prompt
@@ -1281,7 +1266,10 @@ class BackendExecutor:
             # Get tools for current agent
             tools = []
             if self._tool_registry:
-                tools = self._tool_registry.get_tool_definitions()
+                tools = self._tool_registry.get_tool_definitions(
+                    agent_name=self.state.current_agent,
+                    access_policy=self._access_policy,
+                )
             
             # Log model call start
             self._log_debug_model_call(
@@ -1297,11 +1285,13 @@ class BackendExecutor:
                 self._tool_registry, 
                 self.event_bus,
                 permission_manager=self._permission_manager,
-                permission_callback=self._permission_callback,
+                permission_requester=self._permission_requester,
                 backend_state=self.state,
                 sandbox_manager=self._sandbox_manager,
                 hook_runtime=self._hook_runtime,
                 hook_base=self._main_hook_base(self.state.current_run_id or "") if self._hook_runtime else None,
+                agent_name=self.state.current_agent,
+                access_policy=self._access_policy,
             )
             
             # Define interrupt check
@@ -1392,6 +1382,7 @@ class BackendExecutor:
                         tool_name = event.get("tool_name", "unknown")
                         tool_call_id = event.get("tool_call_id", "")
                         args = event.get("args", {})
+                        tool_executor._set_model_tool_context(tool_call_id, tool_name, args)
                         yield Event(EventType.TOOL_EXECUTION_START, {
                             "tool_name": tool_name,
                             "tool_call_id": tool_call_id,
@@ -1410,6 +1401,7 @@ class BackendExecutor:
                         tool_name = event.get("tool_name", "unknown")
                         tool_call_id = event.get("tool_call_id", "")
                         result = event.get("result", "")
+                        tool_executor.set_current_tool_context(None)
                         
                         # Check if user rejected without reason
                         if self.state.user_rejected_without_reason:
@@ -1447,11 +1439,13 @@ class BackendExecutor:
                     elif event_type == "error":
                         # Error occurred
                         error_msg = event.get("message", "Unknown error")
+                        tool_executor.set_current_tool_context(None)
                         yield Event(EventType.MODEL_ERROR, {"error": error_msg})
                         return
                     
                     elif event_type == "interrupted":
                         # Execution was interrupted
+                        tool_executor.set_current_tool_context(None)
                         yield Event(EventType.SYSTEM_INTERRUPT, {"message": "Execution interrupted"})
                         return
                     
@@ -1548,21 +1542,36 @@ class BackendExecutor:
                 
                 tool = self._tool_registry.get(tool_name)
                 result = None
-                if self._sandbox_manager:
+                if self._access_policy:
+                    try:
+                        self._access_policy.assert_tool_allowed(self.state.current_agent, tool_name)
+                    except PermissionError as exc:
+                        result = ToolResult(False, "", str(exc))
+                if result is None and self._sandbox_manager:
                     try:
                         result = self._sandbox_manager.evaluate_pre_execution(tool_name, arguments)
                     except Exception as exc:
                         result = protocol_error_result(exc)
                 if result is None:
-                    result = self._tool_registry.execute(tool_name, **arguments)
+                    result = self._tool_registry.execute(
+                        tool_name,
+                        agent_name=self.state.current_agent,
+                        access_policy=self._access_policy,
+                        **arguments,
+                    )
                     result, rejected_without_reason = execute_with_permissions(
                         tool_name,
                         tool,
                         result,
                         self._permission_manager,
-                        self._permission_callback,
+                        self._permission_requester,
                         sandbox_manager=self._sandbox_manager,
                         arguments=arguments,
+                        request_context={
+                            "tool_call_id": tool_id,
+                            "session_id": self._get_session_id(),
+                            "agent_name": self.state.current_agent,
+                        },
                     )
                     if rejected_without_reason:
                         self.state.user_rejected_without_reason = True
@@ -1746,14 +1755,17 @@ class BackendExecutor:
             # Get tools for file operations
             tools = []
             if self._tool_registry:
-                tools = self._tool_registry.get_tool_definitions()
+                tools = self._tool_registry.get_tool_definitions(
+                    agent_name=self.state.current_agent,
+                    access_policy=self._access_policy,
+                )
             
             # Create tool executor
             tool_executor = GorCodeToolExecutor(
                 self._tool_registry,
                 self.event_bus,
                 permission_manager=self._permission_manager,
-                permission_callback=self._permission_callback,
+                permission_requester=self._permission_requester,
                 backend_state=self.state,
                 sandbox_manager=self._sandbox_manager,
                 hook_runtime=self._hook_runtime,
@@ -1825,15 +1837,19 @@ class BackendExecutor:
                             })
                     elif event_type == "tool_execution":
                         tool_name = event.get("tool_name", "unknown")
+                        tool_call_id = event.get("tool_call_id", "")
+                        args = event.get("args", {})
+                        tool_executor._set_model_tool_context(tool_call_id, tool_name, args)
                         yield Event(EventType.TOOL_EXECUTION_START, {
                             "tool_name": tool_name,
-                            "tool_call_id": event.get("tool_call_id", ""),
-                            "args": event.get("args", {}),
+                            "tool_call_id": tool_call_id,
+                            "args": args,
                             "agent_name": self.state.current_agent,
                         })
                     elif event_type == "tool_result":
                         tool_name = event.get("tool_name", "unknown")
                         result = event.get("result", "")
+                        tool_executor.set_current_tool_context(None)
                         yield Event(EventType.TOOL_RESULT, {
                             "tool_name": tool_name,
                             "tool_call_id": event.get("tool_call_id", ""),
@@ -1843,9 +1859,11 @@ class BackendExecutor:
                         })
                     elif event_type == "error":
                         error_msg = event.get("message", "Unknown error")
+                        tool_executor.set_current_tool_context(None)
                         yield Event(EventType.MODEL_ERROR, {"error": error_msg})
                         return
                     elif event_type == "interrupted":
+                        tool_executor.set_current_tool_context(None)
                         yield Event(EventType.SYSTEM_INTERRUPT, {"message": "Execution interrupted"})
                         return
                     elif event_type == "usage":

@@ -15,6 +15,15 @@ except ImportError:
     from importlib_resources import files, as_file
 
 from .base import AgentInfo, AgentMode, AgentPermission, PermissionLevel
+from .capabilities import (
+    AgentCapabilityConfig,
+)
+from .capability_parser import (
+    legacy_name_list,
+    legacy_tools_dict,
+    parse_allow_rule,
+    parse_deny_rule,
+)
 from ..utils.frontmatter import parse_yaml_frontmatter
 from ..utils.loader_helpers import discover_files, read_text_file
 from ..utils.loader_base import DiscoveredItem, LoaderBase
@@ -299,11 +308,9 @@ class AgentLoader(LoaderBase[AgentInfo]):
         mode_str = frontmatter.get("mode", "all").lower()
         mode = self._parse_mode(mode_str)
         
-        # Parse tools
-        tools = self._parse_tools(frontmatter.get("tools"))
-        
-        # Parse allowsubagents
-        allowsubagents = self._parse_allowsubagents(frontmatter.get("allowsubagents"))
+        capabilities = self._parse_capabilities(frontmatter)
+        tools = legacy_tools_dict(capabilities.tools_allow)
+        allowsubagents = legacy_name_list(capabilities.subagents_allow)
         
         # Parse permissions
         permissions = self._parse_permissions(frontmatter.get("permissions"))
@@ -319,6 +326,7 @@ class AgentLoader(LoaderBase[AgentInfo]):
             prompt=prompt,
             tools=tools,
             allowsubagents=allowsubagents,
+            capabilities=capabilities,
             permissions=permissions or AgentPermission(),
             model_config=frontmatter.get("model", frontmatter.get("model_config")),
             parent=frontmatter.get("parent"),
@@ -336,6 +344,36 @@ class AgentLoader(LoaderBase[AgentInfo]):
             "all": AgentMode.ALL,
         }
         return mode_map.get(mode_str.lower(), AgentMode.ALL)
+
+    def _parse_capabilities(self, frontmatter: Dict[str, Any]) -> AgentCapabilityConfig:
+        return AgentCapabilityConfig(
+            tools_allow=parse_allow_rule(
+                frontmatter.get("tools"),
+                explicit="tools" in frontmatter,
+                missing_default="acceptall",
+                empty_default="denyall",
+            ),
+            tools_deny=parse_deny_rule(
+                frontmatter.get("denytools"),
+                explicit="denytools" in frontmatter,
+            ),
+            skills_allow=parse_allow_rule(
+                frontmatter.get("allowskills"),
+                explicit="allowskills" in frontmatter,
+                missing_default="acceptall",
+                empty_default="denyall",
+            ),
+            skills_deny=parse_deny_rule(
+                frontmatter.get("denyskills"),
+                explicit="denyskills" in frontmatter,
+            ),
+            subagents_allow=parse_allow_rule(
+                frontmatter.get("allowsubagents"),
+                explicit="allowsubagents" in frontmatter,
+                missing_default="denyall",
+                empty_default="denyall",
+            ),
+        )
     
     def _parse_tools(self, tools_value: Any) -> Dict[str, bool]:
         """

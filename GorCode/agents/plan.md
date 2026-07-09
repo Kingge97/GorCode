@@ -2,7 +2,7 @@
 name: plan
 description: Planning agent for designing implementation strategies
 mode: primary
-tools: Read, Glob, Grep, Search
+tools: Read, Glob, Grep
 allowsubagents: explore
 permissions:
   edit: deny

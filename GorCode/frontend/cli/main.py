@@ -270,25 +270,11 @@ def run(
     if debug:
         client.request("debug.set", {"enabled": True})
     
-    ui_renderer = UIRenderer(console, SimpleNamespace(**config))
-    
-    # Set permission callback for UI interaction
-    def permission_callback(permission_type: str, metadata: dict) -> tuple:
-        """
-        Permission callback for UI interaction.
-        
-        Args:
-            permission_type: Type of permission (write, edit, bash, bash_delete)
-            metadata: Permission metadata
-            
-        Returns:
-            Tuple of (response, reason):
-            - response: 'once', 'always', or 'reject'
-            - reason: Rejection reason (None if not rejected)
-        """
-        return ui_renderer.show_permission_dialog(permission_type, metadata)
-    
-    client.set_permission_callback(permission_callback)
+    ui_renderer = UIRenderer(
+        console,
+        SimpleNamespace(**config),
+        permission_responder=client,
+    )
 
     # Apply permission profile (session-level)
     if permission and permission.lower() != "ask":

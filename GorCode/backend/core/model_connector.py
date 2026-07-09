@@ -221,6 +221,16 @@ class ModelConnector:
             priority=priority,
             name=name,
         )
+
+    def remove_hook(
+        self,
+        event: str,
+        handler_or_name,
+    ) -> int:
+        """Forward hook removal to the underlying LLMClient model."""
+        if not self._model_instance:
+            raise RuntimeError("Model is not connected")
+        return self._model_instance.remove_hook(event, handler_or_name)
     
     def chat(
         self,

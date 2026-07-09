@@ -15,6 +15,7 @@ from GorCode.backend.agents.base import AgentRegistry
 
 from .gateway import BackendService
 from .protocol import make_request
+from GorCode.shared.permission import PermissionResponsePayload, PermissionRespondResult
 
 
 class InProcessTransport:
@@ -56,7 +57,7 @@ class FrontendClient:
         self._transport = transport
 
     def set_permission_callback(self, callback) -> None:
-        self._transport.backend.set_permission_callback(callback)
+        raise RuntimeError("permission_callback is obsolete; renderer sends permission.respond")
 
     def set_reconnect_callback(self, callback) -> None:
         self._transport.backend.set_reconnect_callback(callback)
@@ -72,6 +73,16 @@ class FrontendClient:
             "payload": response.get("payload", {}),
             "error": (response.get("payload") or {}).get("error", "Unknown error"),
         }
+
+    def respond_permission(
+        self,
+        payload: PermissionResponsePayload,
+    ) -> PermissionRespondResult:
+        response = self.request("permission.respond", payload.to_dict())
+        return PermissionRespondResult(
+            success=bool(response.get("success")),
+            error=response.get("error"),
+        )
 
     def stream(self, msg_type: str, payload: Optional[Dict[str, Any]] = None) -> Generator[Dict[str, Any], None, None]:
         request = make_request(msg_type, payload or {})

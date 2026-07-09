@@ -15,14 +15,18 @@ from .contracts import (
     CompressionResult,
     CompressionRunResult,
 )
-from .system_prompt import (
-    hide_system_message,
-    restore_system_message,
-    validate_system_message_position,
-)
 from .token_counter import default_count_tokens
 
 HOOK_NAME = "gorcode_compression"
+
+
+def validate_system_message_position(messages: list[dict]) -> None:
+    """Ensure system messages only appear at index 0."""
+    for index, message in enumerate(messages):
+        if message.get("role") != "system":
+            continue
+        if index != 0:
+            raise CompressionError("system message is only allowed at position 0")
 
 
 class CompressionController:
@@ -40,7 +44,6 @@ class CompressionController:
         self.algorithm = algorithm
         self.max_context_length = int(max_context_length)
         self.count_tokens = count_tokens
-        self._attached_model_ids: set[int] = set()
 
     @property
     def trigger_tokens(self) -> int:
@@ -61,16 +64,16 @@ class CompressionController:
     def attach_to_model(self, connector) -> None:
         if not self.settings.enabled:
             return
-        model_id = connector.model_instance_id
-        if model_id in self._attached_model_ids:
-            return
+        connector.remove_hook(
+            self.settings.trigger.event,
+            HOOK_NAME,
+        )
         connector.add_hook(
             self.settings.trigger.event,
             self.handle_before_model_request,
             priority=0,
             name=HOOK_NAME,
         )
-        self._attached_model_ids.add(model_id)
 
     def handle_before_model_request(self, context):
         messages = [copy.deepcopy(message) for message in context.messages]
@@ -131,46 +134,52 @@ class CompressionController:
         source: str,
         metadata: Mapping[str, Any],
     ) -> CompressionResult:
-        hidden = hide_system_message(messages)
-        request = self._build_request(hidden.messages, original_tokens, source, metadata)
+        request = self._build_request(messages, original_tokens, source, metadata)
         result = self.algorithm.compress(request)
         self._validate_result(result)
         return result
 
     def _build_request(
         self,
-        hidden_messages: list[dict],
+        messages: list[dict],
         original_tokens: int,
         source: str,
         metadata: Mapping[str, Any],
     ):
         from .contracts import CompressionRequest
 
+        tools = self._extract_tools(metadata)
         request_metadata = {
             "source": source,
             "current_tokens": original_tokens,
             "trigger_tokens": self.trigger_tokens,
             "algorithm_id": self.settings.algorithm,
             "options": getattr(self.algorithm, "options", {}),
+            "tools": tools,
             **dict(metadata),
         }
         return CompressionRequest(
-            messages=tuple(hidden_messages),
+            messages=tuple(messages),
             context_limit=self.max_context_length,
             threshold_ratio=self.settings.trigger.threshold_ratio,
             count_tokens=self.count_tokens,
             metadata=request_metadata,
         )
 
+    @staticmethod
+    def _extract_tools(metadata: Mapping[str, Any]) -> list[dict]:
+        hook_ctx = metadata.get("hook_context")
+        if isinstance(hook_ctx, Mapping):
+            return list(hook_ctx.get("tools") or [])
+        return []
+
     def _restore_and_validate(
         self,
         original_messages: list[dict],
         result: CompressionResult,
     ) -> list[dict]:
-        hidden = hide_system_message(original_messages)
-        restored = restore_system_message(hidden, result.messages)
-        validate_system_message_position(restored)
-        return restored
+        validate_system_message_position(result.messages)
+        return result.messages
 
     def _validate_result(self, result) -> None:
         if not isinstance(result, CompressionResult):
@@ -208,6 +217,7 @@ class CompressionController:
             "model_name": context.model_name,
             "loop_round": context.loop_round,
             "previous_round_had_tools": context.previous_round_had_tools,
+            "tools": list(context.tool_info) if context.tool_info else [],
         }
 
     def _hook_result_metadata(self, run: CompressionRunResult) -> dict[str, Any]:

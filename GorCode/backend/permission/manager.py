@@ -6,9 +6,8 @@ Session-level permission management for dangerous operations.
 """
 
 from enum import Enum
-from typing import Any, Callable, Dict, Optional, Set
+from typing import Any, Callable, Dict, Optional
 from dataclasses import dataclass, field
-import asyncio
 
 from .rules import (
     PermissionDecision,
@@ -41,9 +40,6 @@ class PermissionRequest:
     permission_type: PermissionType
     metadata: Dict = field(default_factory=dict)
 
-    # For async waiting
-    future: Optional[asyncio.Future] = None
-
 
 class PermissionManager:
     """
@@ -60,29 +56,11 @@ class PermissionManager:
         # Session-level permissions: {PermissionType: bool}
         self._session_permissions: Dict[PermissionType, bool] = {}
 
-        # Pending requests: {request_id: PermissionRequest}
-        self._pending_requests: Dict[str, PermissionRequest] = {}
-
-        # Request counter for generating IDs
-        self._request_counter = 0
-
-        # Permission request callback (set by UI)
-        self._permission_callback = None
-
         # Permission rules/settings
         self._settings = PermissionSettings.from_config(None)
         self._rule_engine = PermissionRuleEngine(self._settings)
         self._deny_tracker: Dict[str, int] = {}
         self._hooks: list[Callable[[PermissionDecision, Dict[str, Any]], None]] = []
-
-    def set_permission_callback(self, callback):
-        """
-        Set callback for permission requests.
-
-        Args:
-            callback: Async function(request_id, permission_type, metadata) -> PermissionResponse
-        """
-        self._permission_callback = callback
 
     def apply_settings(self, config: Any) -> None:
         """Apply permission settings from config."""
@@ -158,107 +136,6 @@ class PermissionManager:
     def clear_session_permissions(self) -> None:
         """Clear all session permissions."""
         self._session_permissions.clear()
-
-    async def request_permission(
-        self,
-        tool_name: str,
-        permission_type: PermissionType,
-        metadata: Dict = None,
-    ) -> PermissionResponse:
-        """
-        Request permission from user.
-
-        Args:
-            permission_type: Type of permission needed
-            metadata: Additional context for the request (file_path, command, diff, etc.)
-
-        Returns:
-            PermissionResponse from user
-
-        Raises:
-            RuntimeError: If no permission callback is set
-        """
-        decision = self.decide(tool_name, permission_type, metadata)
-        if decision.decision == "allow":
-            return PermissionResponse.ONCE
-        if decision.decision == "deny":
-            return PermissionResponse.REJECT
-
-        # No callback set - default to reject for safety
-        if self._permission_callback is None:
-            return PermissionResponse.REJECT
-
-        # Generate request ID
-        self._request_counter += 1
-        request_id = f"perm_{self._request_counter}"
-
-        # Create request
-        future = asyncio.Future()
-        request = PermissionRequest(
-            request_id=request_id,
-            permission_type=permission_type,
-            metadata=metadata or {},
-            future=future,
-        )
-        self._pending_requests[request_id] = request
-
-        # Call UI callback
-        try:
-            response = await self._permission_callback(
-                request_id,
-                permission_type,
-                metadata or {},
-            )
-
-            # Handle response
-            if response == PermissionResponse.ALWAYS:
-                self.grant_session_permission(permission_type)
-            if response == PermissionResponse.REJECT:
-                self.record_denial(tool_name, metadata)
-
-            return response
-
-        finally:
-            # Clean up
-            if request_id in self._pending_requests:
-                del self._pending_requests[request_id]
-
-    def respond_to_request(self, request_id: str, response: PermissionResponse) -> bool:
-        """
-        Respond to a pending permission request.
-
-        Args:
-            request_id: ID of the request
-            response: User's response
-
-        Returns:
-            True if request was found and handled
-        """
-        if request_id not in self._pending_requests:
-            return False
-
-        request = self._pending_requests[request_id]
-
-        # Handle ALWAYS response
-        if response == PermissionResponse.ALWAYS:
-            self.grant_session_permission(request.permission_type)
-
-        # Set future result
-        if request.future and not request.future.done():
-            request.future.set_result(response)
-
-        # Clean up
-        del self._pending_requests[request_id]
-        return True
-
-    def get_pending_requests(self) -> Dict[str, PermissionRequest]:
-        """
-        Get all pending permission requests.
-
-        Returns:
-            Dictionary of request IDs to PermissionRequest objects
-        """
-        return self._pending_requests.copy()
 
     def _apply_mode(
         self,

@@ -18,11 +18,18 @@ from GorCode.backend.config.manager import ConfigManager, GorCodeConfig
 from GorCode.backend.config.initializer import ProjectInitializer
 from GorCode.backend.tools.core_tool_support.base import ToolRegistry
 from GorCode.backend.agents.base import AgentRegistry
-from GorCode.backend.permission import get_permission_manager, PermissionType
+from GorCode.backend.permission import PermissionManager, PermissionType
 from GorCode.backend.mcp import MCPManager, create_mcp_tools
 from GorCode.backend.skills import SkillLoader, SkillInjector
 from GorCode.backend.session import Session, SessionCloneError
 
+from .permission_broker import (
+    BrokerEventAction,
+    BrokerEventDecision,
+    BrokerPermissionRequester,
+    PermissionBroker,
+    PermissionScope,
+)
 from .protocol import make_event, make_response
 
 
@@ -92,15 +99,26 @@ class BackendService:
         config_manager: ConfigManager,
         tool_registry: ToolRegistry,
         agent_registry: AgentRegistry,
+        permission_manager: Optional[PermissionManager] = None,
     ):
         self._config_manager = config_manager
         self._event_bus = EventBus()
-        self._executor = BackendExecutor(self._event_bus)
+        self._permission_manager = permission_manager or PermissionManager()
+        self._permission_broker = PermissionBroker()
+        self._permission_requester = BrokerPermissionRequester(
+            self._permission_broker,
+            self._publish_permission_request,
+        )
+        self._executor = BackendExecutor(
+            self._event_bus,
+            permission_manager=self._permission_manager,
+        )
         self._executor.initialize(
             config_manager=config_manager,
             tool_registry=tool_registry,
             agent_registry=agent_registry,
         )
+        self._executor.set_permission_requester(self._permission_requester)
 
         self._event_queue: "queue.Queue[Event]" = queue.Queue()
         self._subscribe_bus_events()
@@ -115,8 +133,7 @@ class BackendService:
         return self._executor
 
     def set_permission_callback(self, callback) -> None:
-        self._executor.set_permission_callback(callback)
-        self._sync_task_tool()
+        raise RuntimeError("permission_callback is obsolete; renderer handles permission events")
 
     def set_reconnect_callback(self, callback) -> None:
         self._executor.set_reconnect_callback(callback)
@@ -139,8 +156,8 @@ class BackendService:
             task_tool.set_agent_registry(self._executor._agent_registry)
         if hasattr(task_tool, "set_permission_manager"):
             task_tool.set_permission_manager(self._executor._permission_manager)
-        if hasattr(task_tool, "set_permission_callback"):
-            task_tool.set_permission_callback(self._executor._permission_callback)
+        if hasattr(task_tool, "set_permission_requester"):
+            task_tool.set_permission_requester(self._permission_requester)
         if hasattr(task_tool, "set_sandbox_manager"):
             task_tool.set_sandbox_manager(self._executor.sandbox_manager)
         if hasattr(task_tool, "set_hook_runtime"):
@@ -159,13 +176,16 @@ class BackendService:
     def _on_bus_event(self, event: Event) -> None:
         self._event_queue.put(event)
 
+    def _publish_permission_request(self, payload: Dict[str, Any]) -> None:
+        self._event_queue.put(Event(EventType.PERMISSION_REQUEST, payload))
+
     def _drain_bus_events(self) -> Generator[Dict[str, Any], None, None]:
         while True:
             try:
                 event = self._event_queue.get_nowait()
             except queue.Empty:
                 break
-            yield self._event_to_protocol(event)
+            yield from self._process_event_through_broker(event)
 
     def _event_to_protocol(self, event: Event) -> Dict[str, Any]:
         event_type = EVENT_TYPE_TO_PROTOCOL.get(event.event_type)
@@ -177,6 +197,33 @@ class BackendService:
             session_id=self._get_session_id(),
             source=event.source,
         )
+
+    def _default_permission_scope(self) -> PermissionScope:
+        return PermissionScope(
+            frontend_channel_id="cli",
+            session_id=self._get_session_id(),
+        )
+
+    def _process_event_through_broker(
+        self,
+        event: Event,
+    ) -> Generator[Dict[str, Any], None, None]:
+        protocol_event = self._event_to_protocol(event)
+        scope = self._default_permission_scope()
+        yield from self._emit_broker_decision(
+            self._permission_broker.pop_ready_events(scope)
+        )
+        decision = self._permission_broker.classify_event(protocol_event, scope)
+        yield from self._emit_broker_decision(decision)
+
+    def _emit_broker_decision(
+        self,
+        decision: BrokerEventDecision,
+    ) -> Generator[Dict[str, Any], None, None]:
+        if decision.action == BrokerEventAction.ERROR:
+            raise RuntimeError(decision.error or "Permission broker error")
+        for event in decision.events:
+            yield event
 
     def _get_session_id(self) -> Optional[str]:
         session_manager = getattr(self._executor, "_session_manager", None)
@@ -215,6 +262,41 @@ class BackendService:
             session_id=self._get_session_id(),
             success=False,
             error=error,
+        )
+
+    def _handle_permission_respond(
+        self,
+        request_id: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        permission_request_id = str(payload.get("request_id", "")).strip()
+        response = str(payload.get("response", "")).strip().lower()
+        if not permission_request_id:
+            return make_response(
+                request_id,
+                payload={},
+                session_id=self._get_session_id(),
+                success=False,
+                error="permission.respond requires request_id",
+            )
+        try:
+            result = self._permission_broker.respond(
+                permission_request_id,
+                response,
+                payload.get("reason"),
+            )
+        except (KeyError, RuntimeError, ValueError) as exc:
+            return make_response(
+                request_id,
+                payload={},
+                session_id=self._get_session_id(),
+                success=False,
+                error=str(exc),
+            )
+        return make_response(
+            request_id,
+            payload={"success": True, "response": result.response.value},
+            session_id=self._get_session_id(),
         )
 
     def _session_manager_error(self, request_id: str) -> Dict[str, Any]:
@@ -737,11 +819,14 @@ class BackendService:
                     raise exc_holder["exc"]
                 break
 
-            yield self._event_to_protocol(event)
+            yield from self._process_event_through_broker(event)
             yield from self._drain_bus_events()
 
         # Final drain for any remaining bus events
         yield from self._drain_bus_events()
+        yield from self._emit_broker_decision(
+            self._permission_broker.pop_ready_events(self._default_permission_scope())
+        )
 
     def handle_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
         request_type = request.get("type", "")
@@ -749,6 +834,9 @@ class BackendService:
         request_id = request.get("request_id", "")
 
         try:
+            if request_type == "permission.respond":
+                return self._handle_permission_respond(request_id, payload)
+
             if request_type == "config.get":
                 config_manager = self._get_config_manager()
                 if not config_manager:
@@ -1051,8 +1139,7 @@ class BackendService:
 
             if request_type == "context.compact":
                 force = bool(payload.get("force", False))
-                force_soft = bool(payload.get("force_soft", False))
-                result = self._executor.compact_context(force=force, force_soft=force_soft)
+                result = self._executor.compact_context(force=force)
                 return make_response(
                     request_id,
                     payload=result,
@@ -1095,8 +1182,7 @@ class BackendService:
                 )
 
             if request_type == "permission.status":
-                perm_manager = get_permission_manager()
-                permissions = perm_manager.get_session_permissions()
+                permissions = self._permission_manager.get_session_permissions()
                 display = {perm.value: granted for perm, granted in permissions.items()}
                 return make_response(
                     request_id,
@@ -1148,11 +1234,10 @@ class BackendService:
                         success=False,
                         error=f"Invalid permission type: {perm_value}",
                     )
-                perm_manager = get_permission_manager()
                 if request_type == "permission.grant":
-                    perm_manager.grant_session_permission(perm_type)
+                    self._permission_manager.grant_session_permission(perm_type)
                 else:
-                    perm_manager.revoke_session_permission(perm_type)
+                    self._permission_manager.revoke_session_permission(perm_type)
                 return make_response(
                     request_id,
                     payload={"success": True},
@@ -1160,8 +1245,7 @@ class BackendService:
                 )
 
             if request_type == "permission.clear":
-                perm_manager = get_permission_manager()
-                perm_manager.clear_session_permissions()
+                self._permission_manager.clear_session_permissions()
                 return make_response(
                     request_id,
                     payload={"success": True},

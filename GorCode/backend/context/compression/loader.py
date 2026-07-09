@@ -31,11 +31,13 @@ class CompressionAlgorithmLoader:
     def __init__(
         self,
         *,
+        config_manager=None,
         event_bus=None,
         model_manager=None,
         model_connector=None,
         project_path: Path | None = None,
     ):
+        self._config_manager = config_manager
         self._event_bus = event_bus
         self._model_manager = model_manager
         self._model_connector = model_connector
@@ -58,6 +60,7 @@ class CompressionAlgorithmLoader:
 
         algorithm = GorCodeBuiltinCompressionAlgorithm(
             options=config.options,
+            config_manager=self._config_manager,
             event_bus=self._event_bus,
             model_manager=self._model_manager,
             model_connector=self._model_connector,

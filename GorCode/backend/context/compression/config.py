@@ -24,9 +24,6 @@ def default_compression_settings_dict() -> dict[str, Any]:
                 "type": "builtin",
                 "name": DEFAULT_ALGORITHM_ID,
                 "options": {
-                    "soft_enabled": True,
-                    "hard_enabled": True,
-                    "hard_keep_turns": 1,
                     "protected_tools": ["skill", "Skill"],
                 },
             },

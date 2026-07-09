@@ -49,7 +49,7 @@ COMMAND_SPECS: Tuple[CommandSpec, ...] = (
     CommandSpec(
         ("compact",),
         "_cmd_compact",
-        (("/compact [--soft|--hard|--status]", "Compact conversation context"),),
+        (("/compact [--status]", "Compact conversation context"),),
     ),
     CommandSpec(("context",), "_cmd_context", (("/context status|stats", "View context and cache statistics"),)),
     CommandSpec(

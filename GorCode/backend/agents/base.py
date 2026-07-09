@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 
 from ..utils.serialization import dataclass_to_dict
+from .capabilities import AgentCapabilityConfig
 
 
 class AgentMode(Enum):
@@ -58,6 +59,7 @@ class AgentInfo:
     prompt: str = ""
     tools: Dict[str, bool] = field(default_factory=dict)  # Tool permissions: {tool_name: enabled}
     allowsubagents: List[str] = field(default_factory=list)  # Allowed subagents: ["agent1", "agent2"] or ["acceptall"]/["denyall"]
+    capabilities: AgentCapabilityConfig = field(default_factory=AgentCapabilityConfig)
     permissions: AgentPermission = field(default_factory=AgentPermission)
     model_config: Optional[str] = None  # Reference to model config name
     

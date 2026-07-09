@@ -11,8 +11,8 @@ from dataclasses import dataclass
 
 from .core_tool_support.base import BaseTool, ToolResult
 from .core_tool_support.tool_utils import build_parameters_schema, tool_error_result
+from ..agents.capability_prompt import format_capability_sections
 from ..core.events import EventBus, EventType
-from ..permission import get_permission_manager
 from .task_tool_support.subagent_executor import SubagentToolExecutor
 
 if TYPE_CHECKING:
@@ -45,13 +45,23 @@ class TaskTool(BaseTool):
         "general": "General-purpose agent for researching and executing multi-step tasks.",
     }
     
-    def _get_available_agent_types(self) -> Dict[str, str]:
+    def _get_available_agent_types(
+        self,
+        agent_name: Optional[str] = None,
+        access_policy: Any = None,
+    ) -> Dict[str, str]:
         """
         Get available agent types from agent registry.
         
         Returns:
             Dict mapping agent name to description
         """
+        if agent_name and access_policy:
+            return {
+                name: description
+                for name, description in access_policy.subagent_descriptions(agent_name)
+            }
+
         if not self._agent_registry:
             return self.DEFAULT_AGENT_TYPES.copy()
         
@@ -78,7 +88,7 @@ class TaskTool(BaseTool):
         parent_agent_name: str = None,
         config_manager=None,
         permission_manager=None,
-        permission_callback=None,
+        permission_requester=None,
         sandbox_manager=None,
     ):
         """
@@ -101,14 +111,15 @@ class TaskTool(BaseTool):
         self._parent_agent_name = parent_agent_name
         self._config_manager = config_manager
         self._model_connectors: Dict[str, Any] = {}  # Cache for model connectors by agent type
-        self._permission_manager = permission_manager or get_permission_manager()
-        self._permission_callback = permission_callback
+        self._permission_manager = permission_manager
+        self._permission_requester = permission_requester
         self._sandbox_manager = sandbox_manager
         self._hook_runtime: Optional["HookRuntime"] = None
         self._hook_run_id: Optional[str] = None
         self._hook_session_id: Optional[str] = None
         self._hook_model_name: Optional[str] = None
         self._subagent_seq = 0  # Incremental id for subagent runs
+        self._access_policy = None
         
     
     def set_model_connector(self, connector) -> None:
@@ -170,8 +181,11 @@ class TaskTool(BaseTool):
         self._permission_manager = manager
 
     def set_permission_callback(self, callback) -> None:
-        """Set the permission callback for subagent tool execution."""
-        self._permission_callback = callback
+        raise RuntimeError("permission_callback is obsolete; use set_permission_requester")
+
+    def set_permission_requester(self, requester) -> None:
+        """Set the permission requester for subagent tool execution."""
+        self._permission_requester = requester
 
     def set_sandbox_manager(self, manager) -> None:
         """Set the sandbox manager for subagent tool execution."""
@@ -180,6 +194,10 @@ class TaskTool(BaseTool):
     def set_hook_runtime(self, runtime: Optional["HookRuntime"]) -> None:
         """Set the hook runtime for subagent execution."""
         self._hook_runtime = runtime
+
+    def set_access_policy(self, access_policy) -> None:
+        """Set static capability policy snapshot."""
+        self._access_policy = access_policy
 
     def set_hook_run_context(
         self,
@@ -417,6 +435,28 @@ class TaskTool(BaseTool):
         finally:
             self._parent_agent_name = previous_parent_name
 
+    def execute_for_agent(
+        self,
+        agent_name: str,
+        access_policy: Any,
+        description: str,
+        prompt: str,
+        agent_type: str = "explore",
+        max_steps: Optional[int] = None,
+    ) -> ToolResult:
+        """Execute after final static parent-agent subagent assertion."""
+        try:
+            if access_policy:
+                access_policy.assert_subagent_allowed(agent_name, agent_type)
+        except PermissionError as exc:
+            return ToolResult(False, "", str(exc))
+        previous_parent_name = self._parent_agent_name
+        self._parent_agent_name = agent_name
+        try:
+            return self.execute(description, prompt, agent_type, max_steps)
+        finally:
+            self._parent_agent_name = previous_parent_name
+
     def _normalize_max_steps(self, max_steps: Optional[int]) -> Optional[int]:
         try:
             value = int(max_steps) if max_steps is not None else 0
@@ -436,8 +476,9 @@ class TaskTool(BaseTool):
             tool_registry=self._tool_registry,
             is_tool_allowed=self._is_tool_allowed,
             permission_manager=self._permission_manager,
-            permission_callback=self._permission_callback,
+            permission_requester=self._permission_requester,
             sandbox_manager=self._sandbox_manager,
+            access_policy=self._access_policy,
             max_tool_calls=max_tool_calls,
             hook_runtime=self._hook_runtime,
             hook_base=self._subagent_hook_base(agent_type, parent_name, subagent_run_id),
@@ -462,6 +503,7 @@ class TaskTool(BaseTool):
             )
         final_output = ""
         reasoning_output = ""
+        current_round_answer = ""
         tool_calls: List[Dict[str, Any]] = []
         usage = None
         steps = 0
@@ -473,7 +515,8 @@ class TaskTool(BaseTool):
         ):
             event_type = event.get("type", "")
             if event_type == "answer":
-                final_output += event.get("content", "")
+                current_round_answer += event.get("content", "")
+                final_output = current_round_answer
             elif event_type == "thinking":
                 reasoning_output += event.get("content", "")
             elif event_type == "tool_calls":
@@ -482,6 +525,7 @@ class TaskTool(BaseTool):
                 usage = event.get("usage")
             if event_type == "tool_result":
                 steps += 1
+                current_round_answer = ""
             error = self._handle_loop_event(
                 event,
                 display_name,
@@ -506,6 +550,11 @@ class TaskTool(BaseTool):
     def _get_allowed_tool_definitions(self, agent_type: str) -> List[Dict[str, Any]]:
         if not self._tool_registry:
             return []
+        if self._access_policy:
+            return self._tool_registry.get_tool_definitions(
+                agent_name=agent_type,
+                access_policy=self._access_policy,
+            )
         definitions = self._tool_registry.get_tool_definitions()
         return [
             tool_def
@@ -527,10 +576,25 @@ class TaskTool(BaseTool):
         elif event_type == "tool_calls":
             self._emit_subagent_tool_calls(event, display_name, subagent_run_id)
         elif event_type == "tool_execution":
+            self._set_subagent_tool_context(event, tool_executor)
             self._emit_subagent_tool_start(event, display_name, subagent_run_id)
         elif event_type == "tool_result":
+            tool_executor.set_current_tool_context(None)
             self._emit_subagent_tool_result(event, display_name, subagent_run_id)
+        elif event_type in {"error", "connection_error", "interrupted"}:
+            tool_executor.set_current_tool_context(None)
         return self._get_loop_error(event, tool_executor)
+
+    def _set_subagent_tool_context(
+        self,
+        event: Dict[str, Any],
+        tool_executor: SubagentToolExecutor,
+    ) -> None:
+        tool_executor.set_current_tool_context({
+            "tool_call_id": event.get("tool_call_id", ""),
+            "tool_name": event.get("tool_name", "unknown"),
+            "arguments": dict(event.get("args") or {}),
+        })
 
     def _emit_subagent_answer(
         self,
@@ -610,11 +674,19 @@ class TaskTool(BaseTool):
         
         if agent_config and agent_config.prompt:
             base_prompt = agent_config.prompt
-        
-        return base_prompt + "\n\nComplete the task and return a clear, concise summary."
-    
+
+        sections = [base_prompt]
+        capability_section = format_capability_sections(self._access_policy, agent_type)
+        if capability_section:
+            sections.append(capability_section)
+        sections.append("Complete the task and return a clear, concise summary.")
+        return "\n\n".join(sections)
+
     def _is_tool_allowed(self, agent_type: str, tool_name: str) -> bool:
         """Check if a tool is allowed for an agent type."""
+        if self._access_policy:
+            return self._access_policy.is_tool_allowed(agent_type, tool_name)
+
         # Try to get from agent config
         if self._agent_registry:
             agent = self._agent_registry.get(agent_type)
@@ -651,11 +723,46 @@ class TaskTool(BaseTool):
 Agent types:
 {agent_desc}"""
 
+    def get_description_for_agent(
+        self,
+        agent_name: Optional[str] = None,
+        access_policy: Any = None,
+    ) -> str:
+        """Get description with the parent agent's allowed subagent list."""
+        available_types = self._get_available_agent_types(agent_name, access_policy)
+        if not available_types:
+            agent_desc = "(no subagents available)"
+        else:
+            agent_desc = "\n".join([f"- {k}: {v}" for k, v in available_types.items()])
+        return f"""Spawn a subagent for a focused subtask.
+
+Agent types:
+{agent_desc}"""
+
     def get_parameters(self) -> Dict[str, Any]:
         """Get tool parameter schema with dynamic agent types."""
         available_types = self._get_available_agent_types()
-        agent_enum = list(available_types.keys())
-        
+        return self._build_parameters(list(available_types.keys()))
+
+    def get_parameters_for_agent(
+        self,
+        agent_name: Optional[str] = None,
+        access_policy: Any = None,
+    ) -> Dict[str, Any]:
+        """Get parameter schema using the parent agent's allowed subagents."""
+        if not agent_name or not access_policy:
+            return self.get_parameters()
+        available_types = self._get_available_agent_types(agent_name, access_policy)
+        return self._build_parameters(list(available_types.keys()))
+
+    def _build_parameters(self, agent_enum: List[str]) -> Dict[str, Any]:
+        agent_type_schema = {
+            "type": "string",
+            "description": "Type of agent to spawn",
+        }
+        if agent_enum:
+            agent_type_schema["enum"] = agent_enum
+
         return build_parameters_schema(
             properties={
                 "description": {
@@ -666,11 +773,7 @@ Agent types:
                     "type": "string",
                     "description": "Detailed instructions for the subagent"
                 },
-                "agent_type": {
-                    "type": "string",
-                    "enum": agent_enum,
-                    "description": "Type of agent to spawn"
-                },
+                "agent_type": agent_type_schema,
                 "max_steps": {
                     "type": "integer",
                     "description": "Optional maximum number of tool calls (<= 0 for unlimited)",

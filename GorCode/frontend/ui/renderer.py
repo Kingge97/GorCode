@@ -18,6 +18,10 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Prompt
 import time
 from GorCode.frontend.commands.registry import COMMAND_SPECS
+from GorCode.shared.permission import (
+    PermissionResponder,
+    PermissionResponsePayload,
+)
 
 LEGACY_EVENT_MAP = {
     "MODEL_THINKING": "event.model.thinking",
@@ -61,7 +65,12 @@ class UIRenderer:
         "task", "Task",
     }
     
-    def __init__(self, console: Console = None, config: Any = None):
+    def __init__(
+        self,
+        console: Console = None,
+        config: Any = None,
+        permission_responder: Optional[PermissionResponder] = None,
+    ):
         """
         Initialize UI renderer.
         
@@ -80,6 +89,11 @@ class UIRenderer:
         self._diff_page_max_lines = getattr(config, "permission_diff_page_lines", 100)
         self._agent_run_labels: Dict[str, str] = {}  # run_id -> display label
         self._agent_label_counts: Dict[str, int] = {}  # display_name -> count
+        self._permission_responder = permission_responder
+        self._active_permission_request_id: Optional[str] = None
+
+    def set_permission_responder(self, responder: PermissionResponder) -> None:
+        self._permission_responder = responder
     
     def render_event(self, event: Any) -> None:
         """
@@ -498,15 +512,35 @@ class UIRenderer:
         self.console.print(output)
     
     def _render_permission_request(self, event: Dict[str, Any]) -> None:
-        """
-        Render permission request event.
-        
-        Note: Actual permission dialog is shown via callback, 
-        this is just a placeholder for event logging.
-        """
-        # Permission dialog is handled by callback, not by event rendering
-        # This method exists for completeness but does nothing
-        pass
+        """Render permission request and respond through the protocol."""
+        payload = event.get("payload") or {}
+        request_id = str(payload.get("request_id", "")).strip()
+        if not request_id:
+            raise RuntimeError("Permission request event missing request_id")
+        if self._permission_responder is None:
+            raise RuntimeError("Permission responder is not configured")
+
+        self._active_permission_request_id = request_id
+        try:
+            response, reason = self.show_permission_dialog(
+                str(payload.get("permission_type", "")),
+                payload.get("metadata") or {},
+                request_id=request_id,
+                tool_call_id=str(payload.get("tool_call_id", "")),
+                tool_name=str(payload.get("tool_name", "")),
+                agent_name=payload.get("agent_name"),
+                agent_run_id=payload.get("agent_run_id"),
+            )
+            response_payload = PermissionResponsePayload(
+                request_id,
+                _validate_permission_response(response),
+                reason,
+            )
+            result = self._permission_responder.respond_permission(response_payload)
+            if not result.success:
+                raise RuntimeError(result.error or "permission.respond failed")
+        finally:
+            self._active_permission_request_id = None
     
     def _render_user_rejection(self, event: Dict[str, Any]) -> None:
         """
@@ -703,7 +737,13 @@ class UIRenderer:
     def show_permission_dialog(
         self,
         permission_type: str,
-        metadata: Dict[str, Any]
+        metadata: Dict[str, Any],
+        *,
+        request_id: Optional[str] = None,
+        tool_call_id: Optional[str] = None,
+        tool_name: Optional[str] = None,
+        agent_name: Optional[str] = None,
+        agent_run_id: Optional[str] = None,
     ) -> tuple:
         """
         Show permission dialog and get user response.
@@ -718,152 +758,170 @@ class UIRenderer:
             - reason: Rejection reason string (None if not rejected)
         """
         self._show_dialog_header("[bold yellow]⚠️  权限确认请求[/bold yellow]")
-        
-        # Show different content based on permission type
+        self._render_permission_context(
+            request_id=request_id,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            agent_name=agent_name,
+            agent_run_id=agent_run_id,
+        )
+        self._render_permission_details(permission_type, metadata)
+        choice = self._choose_permission_option(permission_type, metadata)
+        result = self._finalize_permission_choice(choice)
+        self._show_dialog_footer()
+        return result
+
+    def _render_permission_details(
+        self,
+        permission_type: str,
+        metadata: Dict[str, Any],
+    ) -> None:
         if permission_type in ("write", "edit"):
-            file_path = metadata.get("file_path", "unknown")
-            diff = metadata.get("diff", "")
-            
-            self.console.print(f"[bold cyan]操作类型:[/bold cyan] {permission_type.upper()}")
-            self.console.print(f"[bold cyan]目标文件:[/bold cyan] {file_path}")
+            self._render_file_permission(permission_type, metadata)
+            return
+        if permission_type == "bash":
+            self._render_bash_permission(metadata.get("command", "unknown"), "yellow")
+            return
+        if permission_type == "bash_delete":
+            self._render_bash_permission(
+                metadata.get("command", "unknown"),
+                "red",
+                warning_text="[bold red]⚠️  危险警告: 此命令包含删除操作![/bold red]",
+            )
+
+    def _render_file_permission(
+        self,
+        permission_type: str,
+        metadata: Dict[str, Any],
+    ) -> None:
+        self.console.print(f"[bold cyan]操作类型:[/bold cyan] {permission_type.upper()}")
+        self.console.print(f"[bold cyan]目标文件:[/bold cyan] {metadata.get('file_path', 'unknown')}")
+        self.console.print()
+        diff = metadata.get("diff", "")
+        if diff:
+            self._render_file_diff_preview(diff)
+            return
+        content_preview = metadata.get("content", "")[:300]
+        if content_preview:
+            self.console.print("[bold yellow]内容预览:[/bold yellow]")
+            self.console.print(Panel(content_preview + "...", border_style="dim"))
             self.console.print()
-            
-            # Show diff if available
-            if diff:
-                self.console.print("[bold yellow]代码变更内容:[/bold yellow]")
-                
-                # Truncate diff if too long
-                max_lines = max(1, self._diff_preview_max_lines)
-                diff_lines = diff.split("\n")
-                if len(diff_lines) > max_lines:
-                    diff_preview = "\n".join(diff_lines[:max_lines])
-                    diff_preview += f"\n... (还有 {len(diff_lines) - max_lines} 行)"
-                else:
-                    diff_preview = diff
-                
-                # Render diff with syntax highlighting
-                self.console.print()
-                self._render_diff(diff_preview)
-                
-                if len(diff_lines) > max_lines:
-                    self.console.print("[dim]可选择 4 查看全部改动[/dim]")
-                self.console.print()
-            else:
-                content_preview = metadata.get("content", "")[:300]
-                if content_preview:
-                    self.console.print("[bold yellow]内容预览:[/bold yellow]")
-                    self.console.print(Panel(content_preview + "...", border_style="dim"))
-                    self.console.print()
-        
-        elif permission_type in ("bash", "bash_delete"):
-            command = metadata.get("command", "unknown")
-            if permission_type == "bash":
-                self._render_bash_permission(command, border_style="yellow")
-            else:
-                self._render_bash_permission(
-                    command,
-                    border_style="red",
-                    warning_text="[bold red]⚠️  危险警告: 此命令包含删除操作![/bold red]",
-                )
-        
+
+    def _render_file_diff_preview(self, diff: str) -> None:
+        self.console.print("[bold yellow]代码变更内容:[/bold yellow]")
+        max_lines = max(1, self._diff_preview_max_lines)
+        diff_lines = diff.split("\n")
+        diff_preview = "\n".join(diff_lines[:max_lines])
+        if len(diff_lines) > max_lines:
+            diff_preview += f"\n... (还有 {len(diff_lines) - max_lines} 行)"
+        self.console.print()
+        self._render_diff(diff_preview)
+        if len(diff_lines) > max_lines:
+            self.console.print("[dim]可选择 4 查看全部改动[/dim]")
+        self.console.print()
+
+    def _choose_permission_option(
+        self,
+        permission_type: str,
+        metadata: Dict[str, Any],
+    ) -> str:
         show_view_all = permission_type in ("write", "edit") and metadata.get("diff", "")
         options, choices = self._build_permission_options(show_view_all=bool(show_view_all))
         self._show_options_menu(options)
-        
-        # Get user input
+        choice = self._prompt_permission_choice(choices)
+        if choice != "4":
+            return choice
+        return self._show_diff_pager(metadata.get("diff", ""))
+
+    def _prompt_permission_choice(self, choices: List[str]) -> str:
+        try:
+            return Prompt.ask(
+                "[bold]请输入选项[/bold]",
+                choices=choices,
+                default="1",
+                show_choices=False,
+            )
+        except (KeyboardInterrupt, EOFError):
+            self.console.print("[yellow]操作已取消,默认拒绝[/yellow]")
+            return "3"
+
+    def _show_diff_pager(self, diff: str) -> str:
+        diff_lines = diff.split("\n")
+        page_size = max(1, self._diff_page_max_lines)
+        total_pages = max(1, (len(diff_lines) + page_size - 1) // page_size)
+        page_index = 0
         while True:
-            try:
-                choice = Prompt.ask(
-                    "[bold]请输入选项[/bold]",
-                    choices=choices,
-                    default="1",
-                    show_choices=False
-                )
-                break
-            except (KeyboardInterrupt, EOFError):
-                self.console.print("[yellow]操作已取消,默认拒绝[/yellow]")
-                choice = "3"
-                break
-        
-        # If user wants to view all changes, enter pager mode
-        if choice == "4":
-            diff_lines = metadata.get("diff", "").split("\n")
-            page_size = max(1, self._diff_page_max_lines)
-            
-            total_pages = max(1, (len(diff_lines) + page_size - 1) // page_size)
-            page_index = 0
-            
-            while True:
-                start = page_index * page_size
-                end = start + page_size
-                diff_page = "\n".join(diff_lines[start:end])
-                
-                self.console.print()
-                self.console.print("─" * 80)
-                self.console.print(f"[bold yellow]全部改动 (第 {page_index + 1}/{total_pages} 页)[/bold yellow]")
-                self.console.print("─" * 80)
-                self.console.print()
-                self._render_diff(diff_page)
-                
-                self.console.print()
-                pager_options, pager_choices = self._build_permission_options(
-                    show_pager=(total_pages > 1)
-                )
-                self._show_options_menu(pager_options, show_top_separator=False)
-                
-                try:
-                    pager_choice = Prompt.ask(
-                        "[bold]请输入选项[/bold]",
-                        choices=pager_choices,
-                        default="1",
-                        show_choices=False
-                    )
-                except (KeyboardInterrupt, EOFError):
-                    self.console.print("[yellow]操作已取消,默认拒绝[/yellow]")
-                    pager_choice = "3"
-                
-                if pager_choice in ("1", "2", "3"):
-                    choice = pager_choice
-                    break
-                if pager_choice == "4":
-                    page_index = max(0, page_index - 1)
-                    continue
-                if pager_choice == "5":
-                    page_index = min(total_pages - 1, page_index + 1)
-                    continue
-            
-        # Show confirmation
+            self._render_diff_page(diff_lines, page_index, page_size, total_pages)
+            options, choices = self._build_permission_options(show_pager=(total_pages > 1))
+            self._show_options_menu(options, show_top_separator=False)
+            choice = self._prompt_permission_choice(choices)
+            if choice in ("1", "2", "3"):
+                return choice
+            if choice == "4":
+                page_index = max(0, page_index - 1)
+            if choice == "5":
+                page_index = min(total_pages - 1, page_index + 1)
+
+    def _render_diff_page(
+        self,
+        diff_lines: List[str],
+        page_index: int,
+        page_size: int,
+        total_pages: int,
+    ) -> None:
+        start = page_index * page_size
+        diff_page = "\n".join(diff_lines[start:start + page_size])
+        self.console.print()
+        self.console.print("─" * 80)
+        self.console.print(f"[bold yellow]全部改动 (第 {page_index + 1}/{total_pages} 页)[/bold yellow]")
+        self.console.print("─" * 80)
+        self.console.print()
+        self._render_diff(diff_page)
+        self.console.print()
+
+    def _finalize_permission_choice(self, choice: str) -> tuple:
         self.console.print()
         if choice == "1":
             self.console.print("[green]✓ 已同意本次操作[/green]")
-            result = ("once", None)
-        elif choice == "2":
+            return "once", None
+        if choice == "2":
             self.console.print("[blue]✓ 已设置session权限,后续操作将自动允许[/blue]")
-            result = ("always", None)
-        else:
-            # User rejected - ask for reason
-            self.console.print("[red]✗ 操作已被拒绝[/red]")
-            self.console.print()
-            
-            try:
-                reason = Prompt.ask(
-                    "[yellow]请输入拒绝理由(可选,按Enter跳过)[/yellow]",
-                    default=""
-                )
-                if reason.strip():
-                    # 用户提供了理由
-                    result = ("reject", reason.strip())
-                else:
-                    # 用户未提供理由（直接按Enter）- 返回None触发回退
-                    result = ("reject", None)
-            except (KeyboardInterrupt, EOFError):
-                # 用户Ctrl+C取消 - 也视为未提供理由
-                result = ("reject", None)
-        
-        self._show_dialog_footer()
-        
-        return result
+            return "always", None
+        self.console.print("[red]✗ 操作已被拒绝[/red]")
+        self.console.print()
+        return "reject", self._prompt_rejection_reason()
 
+    def _prompt_rejection_reason(self) -> Optional[str]:
+        try:
+            reason = Prompt.ask(
+                "[yellow]请输入拒绝理由(可选,按Enter跳过)[/yellow]",
+                default="",
+            )
+        except (KeyboardInterrupt, EOFError):
+            return None
+        return reason.strip() or None
+
+    def _render_permission_context(
+        self,
+        *,
+        request_id: Optional[str],
+        tool_call_id: Optional[str],
+        tool_name: Optional[str],
+        agent_name: Optional[str],
+        agent_run_id: Optional[str],
+    ) -> None:
+        if tool_name:
+            self.console.print(f"[bold cyan]工具:[/bold cyan] {tool_name}")
+        if agent_name:
+            self.console.print(f"[bold cyan]代理:[/bold cyan] {agent_name}")
+        if tool_call_id:
+            self.console.print(f"[dim]tool_call_id: {tool_call_id}[/dim]")
+        if request_id:
+            self.console.print(f"[dim]request_id: {request_id}[/dim]")
+        if agent_run_id:
+            self.console.print(f"[dim]agent_run_id: {agent_run_id}[/dim]")
+        if any([tool_name, agent_name, tool_call_id, request_id, agent_run_id]):
+            self.console.print()
     def show_reconnect_dialog(self, error_message: str = "") -> str:
         """
         Show reconnect dialog and get user choice.
@@ -954,3 +1012,10 @@ class UIRenderer:
         self.console.print()
         self.console.print(Panel(table, title="[bold]Session权限状态[/bold]", border_style="cyan"))
         self.console.print()
+
+
+def _validate_permission_response(response: str):
+    value = str(response).strip().lower()
+    if value not in {"once", "always", "reject"}:
+        raise RuntimeError(f"Invalid permission response: {response}")
+    return value

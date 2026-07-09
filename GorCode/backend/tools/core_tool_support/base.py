@@ -69,16 +69,8 @@ class BaseTool(ABC):
             default_encoding: Default encoding for file operations
         """
         self.default_encoding = default_encoding
-        self._permission_callback = None
-    
     def set_permission_callback(self, callback):
-        """
-        Set permission check callback.
-        
-        Args:
-            callback: Async function(permission_type, metadata) -> PermissionResponse
-        """
-        self._permission_callback = callback
+        raise RuntimeError("permission_callback is obsolete; use PermissionRequester")
     
     @abstractmethod
     def execute(self, **kwargs) -> ToolResult:
@@ -123,6 +115,25 @@ class BaseTool(ABC):
             name=self.name,
             description=self.get_description(),
             parameters=self.get_parameters(),
+            category=self.category,
+        )
+
+    def get_definition_for_agent(
+        self,
+        agent_name: Optional[str] = None,
+        access_policy: Any = None,
+    ) -> ToolDefinition:
+        """Get definition with explicit agent context when a tool supports it."""
+        description = self.get_description()
+        parameters = self.get_parameters()
+        if hasattr(self, "get_description_for_agent"):
+            description = self.get_description_for_agent(agent_name, access_policy)
+        if hasattr(self, "get_parameters_for_agent"):
+            parameters = self.get_parameters_for_agent(agent_name, access_policy)
+        return ToolDefinition(
+            name=self.name,
+            description=description,
+            parameters=parameters,
             category=self.category,
         )
     
@@ -234,7 +245,12 @@ class ToolRegistry:
         """
         return list(self._tools.values())
     
-    def get_tool_definitions(self, category: str = None) -> List[Dict[str, Any]]:
+    def get_tool_definitions(
+        self,
+        category: str = None,
+        agent_name: Optional[str] = None,
+        access_policy: Any = None,
+    ) -> List[Dict[str, Any]]:
         """
         Get tool definitions for model API.
         
@@ -249,7 +265,22 @@ class ToolRegistry:
         else:
             tools = self.get_all_tools()
         # 返回简化格式，不使用 OpenAI 格式的嵌套结构
-        return [tool.get_definition().to_dict() for tool in tools]
+        tools = self._filter_tools_for_agent(tools, agent_name, access_policy)
+        return [
+            tool.get_definition_for_agent(agent_name, access_policy).to_dict()
+            for tool in tools
+        ]
+
+    def _filter_tools_for_agent(
+        self,
+        tools: List[BaseTool],
+        agent_name: Optional[str],
+        access_policy: Any,
+    ) -> List[BaseTool]:
+        if not agent_name or not access_policy:
+            return tools
+        allowed = set(access_policy.allowed_tools(agent_name))
+        return [tool for tool in tools if tool.name in allowed]
     
     def get_categories(self) -> List[str]:
         """
@@ -260,7 +291,13 @@ class ToolRegistry:
         """
         return list(self._categories.keys())
     
-    def execute(self, tool_name: str, **kwargs) -> ToolResult:
+    def execute(
+        self,
+        tool_name: str,
+        agent_name: Optional[str] = None,
+        access_policy: Any = None,
+        **kwargs,
+    ) -> ToolResult:
         """
         Execute a tool by name.
         
@@ -280,11 +317,18 @@ class ToolRegistry:
             )
         
         try:
-            # Add encoding parameter for tools that need it
+            if access_policy and agent_name:
+                access_policy.assert_tool_allowed(agent_name, tool_name)
+
+            if hasattr(tool, "execute_for_agent") and agent_name:
+                return tool.execute_for_agent(agent_name, access_policy, **kwargs)
+
             if tool.needs_encoding and "encoding" not in kwargs:
                 kwargs["encoding"] = tool.default_encoding
             
             return tool.execute(**kwargs)
+        except PermissionError as e:
+            return ToolResult(success=False, output="", error=str(e))
         except Exception as e:
             return tool_error_result(e)
     

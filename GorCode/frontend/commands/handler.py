@@ -883,8 +883,6 @@ class CommandHandler:
     def _cmd_compact(self, args: str) -> bool:
         """Handle /compact command."""
         parser = argparse.ArgumentParser(prog="/compact", add_help=False)
-        parser.add_argument("--soft", action="store_true", help="Soft compaction only (clear tool results)")
-        parser.add_argument("--hard", action="store_true", help="Hard compaction (restructure conversation)")
         parser.add_argument("--status", action="store_true", help="Show compaction status only")
         
         parsed = self._parse_args(parser, args)
@@ -901,51 +899,27 @@ class CommandHandler:
             self.ui_renderer.print(f"  Context limit: {usage.get('context_limit', 0):,}")
             self.ui_renderer.print(f"  Usage: {usage.get('usage_percentage', 0)}%")
             
-            if usage.get('should_hard_compact'):
+            if usage.get('should_compact'):
                 self.ui_renderer.print()
-                self.ui_renderer.print("[red]Context exceeds hard threshold. Hard compaction recommended.[/red]")
-            elif usage.get('should_soft_compact'):
-                self.ui_renderer.print()
-                self.ui_renderer.print("[yellow]Context exceeds soft threshold. Soft compaction recommended.[/yellow]")
+                self.ui_renderer.print("[yellow]Context exceeds threshold. Compaction recommended.[/yellow]")
             return True
         
-        # Determine compaction mode
-        # Default: auto (soft then hard if needed) - forces compaction
-        # --soft: soft only
-        # --hard: hard only
-        force_soft = parsed.soft or (not parsed.soft and not parsed.hard)  # Default to force soft
-        force_hard = parsed.hard
-        
-        # Perform compaction
-        if parsed.soft:
-            self.ui_renderer.print("[dim]Performing soft compaction...[/dim]")
-        elif parsed.hard:
-            self.ui_renderer.print("[dim]Performing hard compaction...[/dim]")
-        else:
-            self.ui_renderer.print("[dim]Compacting context (auto mode)...[/dim]")
+        self.ui_renderer.print("[dim]Compacting context...[/dim]")
         
         result = self.client.request(
             "context.compact",
-            {"force": force_hard, "force_soft": force_soft},
+            {"force": True},
         ).get("payload", {})
         
         if result.get("success"):
-            compaction_type = result.get('compaction_type', 'none')
-            if compaction_type == 'soft':
-                self.ui_renderer.print_success("Soft compaction completed")
-            elif compaction_type == 'hard':
-                self.ui_renderer.print_success("Hard compaction completed")
-            else:
-                self.ui_renderer.print_success("Context compacted successfully")
+            self.ui_renderer.print_success("Context compacted successfully")
             
             self.ui_renderer.print(f"  Original tokens: {result.get('original_tokens', 0):,}")
             self.ui_renderer.print(f"  Compacted tokens: {result.get('compacted_tokens', 0):,}")
             self.ui_renderer.print(f"  Compression ratio: {result.get('compression_ratio', 0):.2f}x")
             
-            if result.get('cleared_tool_results', 0) > 0:
-                self.ui_renderer.print(f"  Cleared tool results: {result.get('cleared_tool_results', 0)}")
-            if result.get('protected_tool_calls'):
-                self.ui_renderer.print(f"  Protected tool calls: {len(result.get('protected_tool_calls', []))}")
+            if result.get('protected_tool_count', 0) > 0:
+                self.ui_renderer.print(f"  Protected tool calls: {result.get('protected_tool_count', 0)}")
             
             # Print summary if available
             summary = result.get('summary')

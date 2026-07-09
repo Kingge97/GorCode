@@ -122,6 +122,18 @@ detailed instructions while preserving prompt cache efficiency."""
         for name, description in skills.items():
             lines.append(f"- {name}: {description}")
         return "\n".join(lines)
+
+    def _format_skill_descriptions_for_agent(
+        self,
+        agent_name: Optional[str],
+        access_policy: Any,
+    ) -> str:
+        if not agent_name or not access_policy:
+            return self._format_skill_descriptions()
+        skills = access_policy.skill_descriptions(agent_name)
+        if not skills:
+            return "(no skills available)"
+        return "\n".join(f"- {name}: {description}" for name, description in skills)
     
     def execute(self, skill: str) -> ToolResult:
         """
@@ -180,6 +192,20 @@ Note: Resources are NOT auto-loaded. If the skill references files, read them ex
                 "content_length": len(wrapped_content),
             }
         )
+
+    def execute_for_agent(
+        self,
+        agent_name: str,
+        access_policy: Any,
+        skill: str,
+    ) -> ToolResult:
+        """Load a skill after final static capability assertion."""
+        try:
+            if access_policy:
+                access_policy.assert_skill_allowed(agent_name, skill)
+        except PermissionError as exc:
+            return ToolResult(False, "", str(exc))
+        return self.execute(skill)
     
     def get_description(self) -> str:
         """
@@ -199,9 +225,42 @@ When to use:
         The skill content (SKILL.md only) will be injected into the conversation,
         giving you detailed instructions."""
 
+    def get_description_for_agent(
+        self,
+        agent_name: Optional[str] = None,
+        access_policy: Any = None,
+    ) -> str:
+        """Get description with the current agent's allowed skill list."""
+        skill_descriptions = self._format_skill_descriptions_for_agent(agent_name, access_policy)
+        return f"""Load a skill to gain specialized knowledge for a task.
+
+Available skills:
+{skill_descriptions}
+
+When to use:
+- IMMEDIATELY when user task matches a skill description
+- Before attempting domain-specific work (PDF, MCP, etc.)
+- When you need detailed instructions for specialized tasks
+
+        The skill content (SKILL.md only) will be injected into the conversation,
+        giving you detailed instructions."""
+
     def get_parameters(self) -> Dict[str, Any]:
         """Get tool parameter schema with dynamic skill options."""
         available_skills = list(self._get_available_skills().keys()) if self._skill_loader else []
+        return self._build_parameters(available_skills)
+
+    def get_parameters_for_agent(
+        self,
+        agent_name: Optional[str] = None,
+        access_policy: Any = None,
+    ) -> Dict[str, Any]:
+        """Get parameter schema using the current agent's allowed skills."""
+        if not agent_name or not access_policy:
+            return self.get_parameters()
+        return self._build_parameters(list(access_policy.allowed_skills(agent_name)))
+
+    def _build_parameters(self, available_skills: list[str]) -> Dict[str, Any]:
         skill_schema = {
             "type": "string",
             "description": "Name of the skill to load",

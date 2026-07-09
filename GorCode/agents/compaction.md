@@ -1,5 +1,24 @@
 ---
 name: compaction
+description: Placeholder agent for agent_model_mapping compaction key
+mode: primary
+hidden: true
+tools: denyall
+allowsubagents: denyall
+---
+# Compaction Agent (Deprecated)
+
+This agent file is no longer used for context compression.
+
+As of Compact V2, context compression uses the current agent's system prompt
+(e.g. `build.md`) directly, not this file. The compression instruction prompt
+and summary prefix are hardcoded constants in `gorcode_builtin.py`.
+
+This file is retained solely as a placeholder for the `compaction` key in
+`agent_model_mapping`, which is used to route the model connection for
+compression LLM calls via `config_manager.get_agent_model("compaction")`.
+---
+name: compaction
 description: Agent for summarizing conversations
 mode: primary
 hidden: true

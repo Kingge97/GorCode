@@ -23,8 +23,9 @@ class SubagentToolExecutor:
         tool_registry: Any,
         is_tool_allowed: Callable[[str, str], bool],
         permission_manager: Any = None,
-        permission_callback: Any = None,
+        permission_requester: Any = None,
         sandbox_manager: Any = None,
+        access_policy: Any = None,
         max_tool_calls: Optional[int] = None,
         hook_runtime: Optional[Any] = None,
         hook_base: Any = None,
@@ -33,13 +34,18 @@ class SubagentToolExecutor:
         self.tool_registry = tool_registry
         self.is_tool_allowed = is_tool_allowed
         self.permission_manager = permission_manager
-        self.permission_callback = permission_callback
+        self.permission_requester = permission_requester
         self.sandbox_manager = sandbox_manager
+        self.access_policy = access_policy
         self.max_tool_calls = max_tool_calls
         self.hook_runtime = hook_runtime
         self.hook_base = hook_base
         self.tool_calls = 0
         self.limit_reached = False
+        self._current_tool_context: Dict[str, Any] = {}
+
+    def set_current_tool_context(self, context: Optional[Dict[str, Any]]) -> None:
+        self._current_tool_context = dict(context or {})
 
     def execute_tool(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         """Execute one tool call for a subagent."""
@@ -79,17 +85,7 @@ class SubagentToolExecutor:
             )
             return self._format_result(result)
 
-        result = self.tool_registry.execute(tool_name, **arguments)
-        self.tool_calls += 1
-        result, _ = execute_with_permissions(
-            tool_name,
-            tool,
-            result,
-            self.permission_manager,
-            self.permission_callback,
-            sandbox_manager=self.sandbox_manager,
-            arguments=arguments,
-        )
+        result = self._execute_registered_tool(tool_name, arguments, tool)
         result = self._run_after_tool_hook(tool_name, arguments, result)
         return self._format_result(result)
 
@@ -161,6 +157,41 @@ class SubagentToolExecutor:
             return self.sandbox_manager.evaluate_pre_execution(tool_name, arguments)
         except Exception as exc:
             return protocol_error_result(exc)
+
+    def _execute_registered_tool(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        tool: Any,
+    ) -> ToolResult:
+        result = self.tool_registry.execute(
+            tool_name,
+            agent_name=self.agent_type,
+            access_policy=self.access_policy,
+            **arguments,
+        )
+        self.tool_calls += 1
+        result, _ = execute_with_permissions(
+            tool_name,
+            tool,
+            result,
+            self.permission_manager,
+            self.permission_requester,
+            sandbox_manager=self.sandbox_manager,
+            arguments=arguments,
+            request_context=self._permission_request_context(),
+        )
+        return result
+
+    def _permission_request_context(self) -> Dict[str, Any]:
+        context = dict(self._current_tool_context)
+        if self.hook_base:
+            context.setdefault("session_id", self.hook_base.session_id)
+            context.setdefault("agent_run_id", self.hook_base.agent_run_id)
+            context.setdefault("agent_name", self.hook_base.agent_name)
+        else:
+            context.setdefault("agent_name", self.agent_type)
+        return context
 
     def _format_result(self, result: ToolResult) -> str:
         if result.success:
